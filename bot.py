@@ -189,7 +189,7 @@ async def run_script(name: str, args: list[str], progress: Progress,
     env = dict(os.environ)
     env.pop("ROOT_PASSWORD_OVERRIDE", None)
     env.update(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-               LC_ALL="C.UTF-8", DEBIAN_FRONTEND="noninteractive")
+               LC_ALL="C.UTF-8", DEBIAN_FRONTEND="noninteractive", HOME="/root")
     if extra_env:
         env.update(extra_env)
     proc = await asyncio.create_subprocess_exec(

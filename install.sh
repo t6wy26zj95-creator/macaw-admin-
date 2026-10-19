@@ -83,7 +83,7 @@ Wants=network-online.target
 [Service]
 WorkingDirectory=/opt/macaw-admin
 ExecStart=/opt/macaw-admin/venv/bin/python /opt/macaw-admin/bot.py
-Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUNBUFFERED=1 HOME=/root
 Restart=always
 RestartSec=5
 

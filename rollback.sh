@@ -3,6 +3,7 @@
 # Undoes a failed switchover: stops services on NEW_IP, points DuckDNS back here,
 # starts everything here again. Run by bot.py as root.
 set -uo pipefail
+export HOME=/root
 NEW="${1:?usage: rollback.sh NEW_IP}"
 set -a; source /opt/macaw-admin/.env; set +a
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o StrictHostKeyChecking=accept-new"

@@ -3,6 +3,7 @@
 # Pushes every Macaw service from this server to NEW_IP. Run by bot.py as root.
 # Protocol on stdout: ##STEP n/8 text, ##NEEDPASS, ##FAIL text, ##RESULT k=v ..., ##DONE
 set -euo pipefail
+export HOME=/root  # systemd services get no HOME; ssh-copy-id needs ~/.ssh
 NEW="${1:?usage: migrate.sh NEW_IP}"
 set -a; source /opt/macaw-admin/.env; set +a
 [ -n "${ROOT_PASSWORD_OVERRIDE:-}" ] && ROOT_PASSWORD="$ROOT_PASSWORD_OVERRIDE"
