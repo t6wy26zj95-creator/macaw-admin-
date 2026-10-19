@@ -23,6 +23,8 @@ from pathlib import Path
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+
+from cloud import OPENRC_KEYS, Cloud, CloudError, cloud_config, parse_openrc
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -94,8 +96,8 @@ def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     ])
 
 
-MENU = kb([("Migrate to a new server", "migrate")], [("Wipe old server", "wipe")],
-          [("Email settings", "email")], [("Update admin bot", "update")])
+MENU = kb([("New server at HostVDS", "newsrv")], [("Migrate to a new server", "migrate")],
+          [("Wipe old server", "wipe")], [("Email settings", "email")], [("Update admin bot", "update")])
 CANCEL = kb([("Cancel", "cancel")])
 CONFIRM = kb([("Start", "start"), ("Cancel", "cancel")])
 
@@ -114,6 +116,8 @@ class State:
     # idle | ask_ip | confirm | running | ask_pass | failed | rolling_back | handoff
     # wipe_ask_ip | wipe_confirm | wiping | wipe_ask_pass | wipe_failed
     # email_ask_user | email_ask_pass | email_ask_to
+    # cloud_ask_openrc | cloud_ask_pass | cloud_pick_flavor | cloud_pick_net | cloud_pick_image
+    # newsrv_confirm | creating | srvdel_confirm
     mode: str = "idle"
     ip: str = ""
     password: str | None = None   # override sent via NEEDPASS
@@ -123,13 +127,16 @@ class State:
     wipe_password: str | None = None
     email_user: str = ""
     email_password: str = ""
+    cloud_tmp: dict = field(default_factory=dict)    # HostVDS settings being set up
+    cloud_lists: dict = field(default_factory=dict)  # flavors / networks / images to pick from
+    del_ip: str = ""
     pending_file: tuple[str, str] | None = None  # (file_id, file_name) waiting for Send
     task: asyncio.Task | None = None
 
 
 S = State()
 CURRENT_IP = ""
-BUSY = {"running", "rolling_back", "handoff", "wiping"}
+BUSY = {"running", "rolling_back", "handoff", "wiping", "creating"}
 
 
 # ---------- progress message ----------
@@ -482,7 +489,92 @@ async def wipe(bot: Bot) -> None:
         "Removed: SRS bot, tunnel, player and admin bot with their services, data, Docker volumes, "
         ".env files with tokens, install leftovers, cloudflared and the SSH keys between the two servers.",
         "Amnezia and Docker were not touched.",
-    ]), reply_markup=MENU)
+    ]), reply_markup=kb([(f"Delete {ip} at HostVDS", f"srvdel:{ip}")], [("Menu", "menu")])
+        if cloud_creds_ready() else MENU)
+
+
+# ---------- HostVDS servers ----------
+
+CLOUD_SETTINGS = ("HOSTVDS_FLAVOR", "HOSTVDS_NETWORK", "HOSTVDS_IMAGE")
+
+
+def cloud_creds_ready() -> bool:
+    return all(CFG.get(k) for k in ("OS_AUTH_URL", "OS_USERNAME", "OS_PASSWORD"))
+
+
+def cloud_ready() -> bool:
+    return cloud_creds_ready() and all(CFG.get(k) for k in CLOUD_SETTINGS)
+
+
+def flavor_label(f: dict) -> str:
+    return f"{f.get('name')}: {f.get('vcpus')} CPU, {f.get('ram', 0) / 1024:g} GB RAM, {f.get('disk')} GB"
+
+
+async def ensure_ssh_key() -> str:
+    key = Path("/root/.ssh/id_ed25519")
+    if not key.exists():
+        key.parent.mkdir(mode=0o700, exist_ok=True)
+        proc = await asyncio.create_subprocess_exec("ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key), "-q")
+        await proc.wait()
+    return key.with_suffix(".pub").read_text().strip()
+
+
+async def wait_port_22(ip: str, timeout: int = 600) -> bool:
+    for _ in range(timeout // 10):
+        try:
+            _, w = await asyncio.wait_for(asyncio.open_connection(ip, 22), 10)
+            w.close()
+            return True
+        except Exception:
+            await asyncio.sleep(10)
+    return False
+
+
+async def create_server(bot: Bot) -> None:
+    S.mode = "creating"
+    progress = Progress(bot, "New server at HostVDS")
+    await progress.show()
+    c = Cloud(CFG)
+    try:
+        await progress.step("1/3 Ordering the server")
+        flavors = {f["id"]: f for f in await c.flavors()}
+        flavor = flavors.get(CFG["HOSTVDS_FLAVOR"])
+        if not flavor:
+            raise CloudError("The saved plan no longer exists. Change the server settings.")
+        pubkey = await ensure_ssh_key()
+        name = f"macaw-{datetime.now():%Y%m%d-%H%M}"
+        sid = await c.create_server(name, flavor, CFG["HOSTVDS_IMAGE"], CFG["HOSTVDS_NETWORK"],
+                                    cloud_config(CFG["ROOT_PASSWORD"], pubkey))
+        await progress.step("2/3 Waiting for it to start")
+        srv = await c.wait_active(sid)
+        ip = Cloud.ipv4(srv)
+        await progress.step(f"3/3 Waiting for SSH on {ip}")
+        if not await wait_port_22(ip):
+            raise CloudError(f"Server {ip} started, but SSH did not come up in 10 minutes")
+    except Exception as e:
+        log.exception("create server failed")
+        progress.finish_running("failed")
+        await progress.show()
+        S.mode = "idle"
+        await bot.send_message(OWNER_ID, f"Creating the server failed: {html.escape(str(e))[:700]}", reply_markup=MENU)
+        return
+    progress.finish_running("done")
+    await progress.show()
+    S.mode = "idle"
+    await bot.send_message(
+        OWNER_ID,
+        f"New server <code>{ip}</code> is ready ({html.escape(flavor.get('name', ''))}, {html.escape(name)}). "
+        "The root password is your standard one.\n\n"
+        "Next: set up the VPN on it with the Amnezia app, then tap the button below.",
+        reply_markup=kb([(f"Migrate to {ip}", f"migrate_to:{ip}")], [("Menu", "menu")]))
+
+
+async def show_cloud_setup_start(message: Message) -> None:
+    S.mode, S.cloud_tmp, S.cloud_lists = "cloud_ask_openrc", {}, {}
+    await message.answer(
+        "HostVDS setup (one time).\n\n"
+        "On the HostVDS API page, under OpenStack CLI Client, download the openrc file and send it to me here.",
+        reply_markup=CANCEL)
 
 
 def start_task(coro) -> None:
@@ -652,7 +744,23 @@ async def cb_email(cb: CallbackQuery):
 
 @router.message(F.document)
 async def on_document(message: Message):
-    if S.mode in ("ask_pass", "wipe_ask_pass", "email_ask_pass"):
+    if S.mode == "cloud_ask_openrc":
+        try:
+            buf = await message.bot.download(message.document)
+            values = parse_openrc(buf.read().decode("utf-8", "replace"))
+        except Exception as e:
+            await message.answer(f"Could not read that file: {html.escape(str(e))[:200]}", reply_markup=CANCEL)
+            return
+        if not values.get("OS_AUTH_URL") or not values.get("OS_USERNAME") or not (
+                values.get("OS_PROJECT_ID") or values.get("OS_PROJECT_NAME")):
+            await message.answer("That doesn't look like an openrc file (no OS_AUTH_URL / OS_USERNAME / project). "
+                                 "Send the openrc file from the HostVDS API page.", reply_markup=CANCEL)
+            return
+        S.cloud_tmp, S.mode = values, "cloud_ask_pass"
+        await message.answer("Got it. Now send the API password (tap Show on the HostVDS API page and copy it). "
+                             "I will delete your message right away.", reply_markup=CANCEL)
+        return
+    if S.mode in ("ask_pass", "wipe_ask_pass", "email_ask_pass", "cloud_ask_pass"):
         await message.answer("I'm waiting for a password, not a file. Tap Cancel first.", reply_markup=CANCEL)
         return
     if not email_ready():
@@ -722,13 +830,173 @@ async def cb_update(cb: CallbackQuery):
     await cb.message.answer("Updating from GitHub. The bot restarts and says hello when it's done.")
 
 
+@router.callback_query(F.data == "menu")
+async def cb_menu(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if S.mode not in BUSY and not S.switched:
+        S.mode = "idle"
+    await cb.message.answer(f"Macaw admin bot. Current server: <code>{CURRENT_IP}</code>.", reply_markup=MENU)
+
+
+@router.callback_query(F.data.startswith("migrate_to:"))
+async def cb_migrate_to(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode in BUSY or S.switched:
+        await cb.message.answer("Not now: a migration, rollback or wipe is running or unfinished.")
+        return
+    await drop_buttons(cb)
+    S.ip, S.mode = cb.data.split(":", 1)[1], "confirm"
+    S.password, S.password_saved = None, False
+    await cb.message.answer(f"Migrating to <code>{S.ip}</code>. Is the VPN already set up on the new server?",
+                            reply_markup=CONFIRM)
+
+
+@router.callback_query(F.data == "newsrv")
+async def cb_newsrv(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode in BUSY:
+        await cb.message.answer("Not now: something is already running.")
+        return
+    if not cloud_ready():
+        await show_cloud_setup_start(cb.message)
+        return
+    S.mode = "newsrv_confirm"
+    await cb.message.answer(
+        "Create a new server at HostVDS?\n\n"
+        f"Plan: {html.escape(CFG.get('HOSTVDS_FLAVOR_LABEL', CFG['HOSTVDS_FLAVOR']))}\n"
+        f"Network: {html.escape(CFG.get('HOSTVDS_NETWORK_LABEL', CFG['HOSTVDS_NETWORK']))}\n"
+        f"System: {html.escape(CFG.get('HOSTVDS_IMAGE_LABEL', CFG['HOSTVDS_IMAGE']))}\n\n"
+        "HostVDS starts billing it right away.",
+        reply_markup=kb([("Create", "newsrv_go"), ("Cancel", "cancel")], [("Change server settings", "cloud_setup")]))
+
+
+@router.callback_query(F.data == "cloud_setup")
+async def cb_cloud_setup(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if S.mode in BUSY:
+        return
+    await show_cloud_setup_start(cb.message)
+
+
+@router.callback_query(F.data == "newsrv_go")
+async def cb_newsrv_go(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if S.mode != "newsrv_confirm":
+        return
+    start_task(create_server(cb.bot))
+
+
+@router.callback_query(F.data.startswith("cflav:"))
+async def cb_cloud_flavor(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode != "cloud_pick_flavor":
+        return
+    await drop_buttons(cb)
+    f = S.cloud_lists["flavors"][int(cb.data.split(":")[1])]
+    S.cloud_tmp["HOSTVDS_FLAVOR"], S.cloud_tmp["HOSTVDS_FLAVOR_LABEL"] = f["id"], flavor_label(f)
+    S.mode = "cloud_pick_net"
+    nets = S.cloud_lists["networks"]
+    await cb.message.answer(f"Plan: {html.escape(flavor_label(f))}.\n\nNow pick the network (you want IPv4+IPv6):",
+                            reply_markup=kb(*[[(f"{n.get('name') or n['id'][:8]} ({n['_label']})", f"cnet:{i}")]
+                                              for i, n in enumerate(nets)], [("Cancel", "cancel")]))
+
+
+async def finish_cloud_setup(message: Message, image: dict) -> None:
+    S.cloud_tmp["HOSTVDS_IMAGE"], S.cloud_tmp["HOSTVDS_IMAGE_LABEL"] = image["id"], image.get("name", image["id"])
+    for k, v in S.cloud_tmp.items():
+        set_env(k, v)
+    S.mode, S.cloud_tmp, S.cloud_lists = "idle", {}, {}
+    await message.answer(
+        "HostVDS is set up.\n\n"
+        f"Plan: {html.escape(CFG['HOSTVDS_FLAVOR_LABEL'])}\n"
+        f"Network: {html.escape(CFG['HOSTVDS_NETWORK_LABEL'])}\n"
+        f"System: {html.escape(CFG['HOSTVDS_IMAGE_LABEL'])}",
+        reply_markup=kb([("Create a server now", "newsrv")], [("Menu", "menu")]))
+
+
+@router.callback_query(F.data.startswith("cnet:"))
+async def cb_cloud_net(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode != "cloud_pick_net":
+        return
+    await drop_buttons(cb)
+    n = S.cloud_lists["networks"][int(cb.data.split(":")[1])]
+    S.cloud_tmp["HOSTVDS_NETWORK"] = n["id"]
+    S.cloud_tmp["HOSTVDS_NETWORK_LABEL"] = f"{n.get('name') or n['id'][:8]} ({n['_label']})"
+    image = Cloud.pick_ubuntu_2404(S.cloud_lists["images"])
+    if image:
+        await finish_cloud_setup(cb.message, image)
+        return
+    S.mode = "cloud_pick_image"
+    imgs = S.cloud_lists["images"][:30]
+    await cb.message.answer("I couldn't find Ubuntu 24.04 by name. Pick the Ubuntu 24.04 image:",
+                            reply_markup=kb(*[[(i.get("name", i["id"])[:60], f"cimg:{n}")] for n, i in enumerate(imgs)],
+                                            [("Cancel", "cancel")]))
+
+
+@router.callback_query(F.data.startswith("cimg:"))
+async def cb_cloud_image(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode != "cloud_pick_image":
+        return
+    await drop_buttons(cb)
+    await finish_cloud_setup(cb.message, S.cloud_lists["images"][int(cb.data.split(":")[1])])
+
+
+@router.callback_query(F.data.startswith("srvdel:"))
+async def cb_srvdel(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode in BUSY:
+        return
+    await drop_buttons(cb)
+    S.del_ip, S.mode = cb.data.split(":", 1)[1], "srvdel_confirm"
+    await cb.message.answer(f"Delete server <code>{S.del_ip}</code> at HostVDS? It is destroyed for good "
+                            "and billing for it stops.",
+                            reply_markup=kb([("Delete", "srvdel_go"), ("Cancel", "cancel")]))
+
+
+@router.callback_query(F.data == "srvdel_go")
+async def cb_srvdel_go(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if S.mode != "srvdel_confirm":
+        return
+    ip, S.mode = S.del_ip, "idle"
+    try:
+        live = await asyncio.to_thread(socket.gethostbyname, DOMAIN)
+    except OSError:
+        live = ""
+    if ip in (CURRENT_IP, live):
+        await cb.message.answer(f"<code>{ip}</code> is the live server. Not deleting it.", reply_markup=MENU)
+        return
+    try:
+        c = Cloud(CFG)
+        srv = await c.find_by_ip(ip)
+        if not srv:
+            await cb.message.answer(f"No server with IP <code>{ip}</code> in your HostVDS account. "
+                                    "Delete it in the HostVDS panel if it's elsewhere.", reply_markup=MENU)
+            return
+        await c.delete_server(srv["id"])
+    except Exception as e:
+        await cb.message.answer(f"Deleting failed: {html.escape(str(e))[:500]}", reply_markup=MENU)
+        return
+    await cb.message.answer(f"Server <code>{ip}</code> ({html.escape(srv.get('name', ''))}) is being deleted "
+                            "at HostVDS.", reply_markup=MENU)
+
+
 @router.callback_query(F.data == "cancel")
 async def cb_cancel(cb: CallbackQuery):
     await cb.answer()
     await drop_buttons(cb)
     if S.mode in ("wipe_ask_ip", "wipe_confirm", "wipe_ask_pass", "wipe_failed",
-                  "email_ask_user", "email_ask_pass", "email_ask_to"):
+                  "email_ask_user", "email_ask_pass", "email_ask_to",
+                  "cloud_ask_openrc", "cloud_ask_pass", "cloud_pick_flavor", "cloud_pick_net", "cloud_pick_image",
+                  "newsrv_confirm", "srvdel_confirm"):
         S.mode, S.wipe_password, S.email_password = "idle", None, ""
+        S.cloud_tmp, S.cloud_lists = {}, {}
         await cb.message.answer("Cancelled.", reply_markup=MENU)
         return
     if S.mode not in ("ask_ip", "confirm", "ask_pass"):
@@ -770,6 +1038,39 @@ async def cb_rollback(cb: CallbackQuery):
 
 @router.message()
 async def on_message(message: Message):
+    if S.mode == "cloud_ask_pass":
+        try:
+            await message.delete()
+        except TelegramAPIError:
+            await message.answer("I could not delete your message with the password. Please delete it yourself.")
+        password = (message.text or "").strip()
+        if not password:
+            await message.answer("Send the API password as text.", reply_markup=CANCEL)
+            return
+        c = Cloud({**S.cloud_tmp, "OS_PASSWORD": password})
+        try:
+            await c.auth()
+            flavors, nets, images = await c.flavors(), await c.networks(), await c.images()
+        except Exception as e:
+            await message.answer(f"{html.escape(str(e))[:500]}\n\nSend the API password again to retry.",
+                                 reply_markup=CANCEL)
+            return
+        if not flavors or not nets:
+            await message.answer("Logged in, but HostVDS returned no plans or networks.", reply_markup=MENU)
+            S.mode = "idle"
+            return
+        S.cloud_tmp["OS_PASSWORD"] = password
+        S.cloud_lists = {"flavors": flavors[:40], "networks": nets, "images": images}
+        S.mode = "cloud_pick_flavor"
+        rows = []
+        for i, f in enumerate(S.cloud_lists["flavors"]):
+            mark = " <- 3 euro plan?" if (f.get("vcpus"), f.get("ram"), f.get("disk")) == (1, 2048, 20) else ""
+            rows.append([(flavor_label(f) + mark, f"cflav:{i}")])
+        await message.answer("Logged in to HostVDS. Pick the plan for new servers "
+                             "(HostVDS-2 is 1 CPU, 2 GB RAM, 20 GB):",
+                             reply_markup=kb(*rows, [("Cancel", "cancel")]))
+        return
+
     if S.mode == "email_ask_pass":
         try:
             await message.delete()
