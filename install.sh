@@ -21,6 +21,10 @@ apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3-venv sshpass rsync cur
 
 echo "== Downloading the bot"
 mkdir -p "$DIR/logs"
+# raw.githubusercontent.com caches "main" for up to 5 minutes, so pin the latest commit.
+SHA=$(curl -fsSL -H 'Accept: application/vnd.github.sha' \
+  https://api.github.com/repos/t6wy26zj95-creator/macaw-admin-/commits/main 2>/dev/null || true)
+[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] && REPO_RAW="${REPO_RAW%/main}/$SHA" && echo "version ${SHA:0:7}"
 tmp=$(mktemp -d)
 for f in bot.py migrate.sh rollback.sh; do
   curl -fsSL "$REPO_RAW/$f" -o "$tmp/$f"
