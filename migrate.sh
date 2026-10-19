@@ -144,5 +144,7 @@ for i in $(seq 12); do
   TUN=$(new "curl -s --max-time 5 127.0.0.1:8091/quicktunnel" | grep -Po '"hostname":"\K[^"]+' || true)
   [ -n "$TUN" ] && break; sleep 5
 done
+# Remember where we came from, so the new admin bot can offer to wipe it.
+[ -n "${MIGRATE_FROM:-}" ] && { new "echo '$MIGRATE_FROM' >> /opt/macaw-admin/old-servers" || true; }
 echo "##RESULT player=$code tunnel=${TUN:-?} duckdns=OK"
 echo "##DONE"

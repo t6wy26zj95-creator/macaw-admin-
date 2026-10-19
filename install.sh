@@ -11,8 +11,6 @@ REPO_RAW="https://raw.githubusercontent.com/t6wy26zj95-creator/macaw-admin-/main
 DIR=/opt/macaw-admin
 
 [ "$(id -u)" = 0 ] || { echo "Run as root."; exit 1; }
-# stdin is the piped script, so questions are asked on the terminal directly.
-[ -r /dev/tty ] || { echo "No terminal to ask questions on. Run it from an SSH session."; exit 1; }
 
 echo "== Installing packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -24,15 +22,19 @@ mkdir -p "$DIR/logs"
 # raw.githubusercontent.com caches "main" for up to 5 minutes, so pin the latest commit.
 SHA=$(curl -fsSL -H 'Accept: application/vnd.github.sha' \
   https://api.github.com/repos/t6wy26zj95-creator/macaw-admin-/commits/main 2>/dev/null || true)
-[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] && REPO_RAW="${REPO_RAW%/main}/$SHA" && echo "version ${SHA:0:7}"
+VERSION=unknown
+if [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then REPO_RAW="${REPO_RAW%/main}/$SHA"; VERSION=${SHA:0:7}; fi
+echo "version $VERSION"
 tmp=$(mktemp -d)
-for f in bot.py migrate.sh rollback.sh; do
+for f in bot.py migrate.sh rollback.sh wipe.sh; do
   curl -fsSL "$REPO_RAW/$f" -o "$tmp/$f"
 done
 install -m 644 "$tmp/bot.py" "$DIR/bot.py"
 install -m 700 "$tmp/migrate.sh" "$DIR/migrate.sh"
 install -m 700 "$tmp/rollback.sh" "$DIR/rollback.sh"
+install -m 700 "$tmp/wipe.sh" "$DIR/wipe.sh"
 rm -rf "$tmp"
+echo "$VERSION" > "$DIR/VERSION"
 
 # Single-quote a value so `source .env` keeps $, spaces and quotes as they are.
 sq(){ local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
@@ -48,6 +50,8 @@ env_ok(){
 if env_ok; then
   echo "== Keeping the existing $DIR/.env"
 else
+  # stdin is the piped script, so questions are asked on the terminal directly.
+  [ -r /dev/tty ] || { echo "No terminal to ask questions on. Run it from an SSH session."; exit 1; }
   echo
   echo "== Secrets (stored only in $DIR/.env, readable by root only)"
   BOT_TOKEN=$(ask "Admin bot token from @BotFather")

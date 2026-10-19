@@ -32,6 +32,7 @@ ENV_FILE = BASE / ".env"
 LOG_DIR = BASE / "logs"
 LOCK = "/run/macaw-migrate.lock"
 HANDOFF_FAILED = BASE / "handoff-failed"
+OLD_SERVERS = BASE / "old-servers"  # written on the new server by migrate.sh
 SCRIPT_TIMEOUT = 30 * 60
 LOCKED_RC = 75  # flock exit code when another run holds the lock
 
@@ -85,7 +86,7 @@ def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     ])
 
 
-MENU = kb([("Migrate to a new server", "migrate")])
+MENU = kb([("Migrate to a new server", "migrate")], [("Wipe old server", "wipe")], [("Update admin bot", "update")])
 CANCEL = kb([("Cancel", "cancel")])
 CONFIRM = kb([("Start", "start"), ("Cancel", "cancel")])
 
@@ -102,17 +103,20 @@ def failure_kb() -> InlineKeyboardMarkup:
 @dataclass
 class State:
     # idle | ask_ip | confirm | running | ask_pass | failed | rolling_back | handoff
+    # wipe_ask_ip | wipe_confirm | wiping | wipe_ask_pass | wipe_failed
     mode: str = "idle"
     ip: str = ""
     password: str | None = None   # override sent via NEEDPASS
     password_saved: bool = False
     switched: bool = False        # some attempt reached step 6: services here are stopped
+    wipe_ip: str = ""
+    wipe_password: str | None = None
     task: asyncio.Task | None = None
 
 
 S = State()
 CURRENT_IP = ""
-BUSY = {"running", "rolling_back", "handoff"}
+BUSY = {"running", "rolling_back", "handoff", "wiping"}
 
 
 # ---------- progress message ----------
@@ -240,7 +244,7 @@ async def run_script(name: str, args: list[str], progress: Progress,
     return res
 
 
-async def send_failure(bot: Bot, res: RunResult, what: str, total: int) -> None:
+async def send_failure(bot: Bot, res: RunResult, what: str, total: int, markup=None) -> None:
     where = f" at step {res.last_step}/{total}" if res.last_step else ""
     if res.timed_out:
         text = f"{what} timed out after {SCRIPT_TIMEOUT // 60} minutes{where}."
@@ -248,17 +252,18 @@ async def send_failure(bot: Bot, res: RunResult, what: str, total: int) -> None:
         text = f"{what} failed{where}: {html.escape(res.fail)}"
     else:
         text = f"{what} stopped unexpectedly{where} (exit code {res.rc})."
-    if S.switched:
+    if S.switched and markup is None:
         text += ("\n\nServices on this server are stopped. Retry to continue the migration, "
                  "or Roll back to bring them back here.")
     text += "\n\nFull log attached."
     if len(text) > 1000:
         text = text[:990] + "..."
+    markup = markup or failure_kb()
     try:
-        await bot.send_document(OWNER_ID, FSInputFile(res.log), caption=text, reply_markup=failure_kb())
+        await bot.send_document(OWNER_ID, FSInputFile(res.log), caption=text, reply_markup=markup)
     except TelegramAPIError as e:
         log.warning("sending log failed: %s", e)
-        await bot.send_message(OWNER_ID, text + f"\nLog: {res.log}", reply_markup=failure_kb())
+        await bot.send_message(OWNER_ID, text + f"\nLog: {res.log}", reply_markup=markup)
 
 
 # ---------- migration ----------
@@ -278,7 +283,9 @@ async def migration(bot: Bot) -> None:
             save_password(S.password)
             S.password_saved = True
 
-    extra = {"ROOT_PASSWORD_OVERRIDE": S.password} if S.password else None
+    extra = {"MIGRATE_FROM": CURRENT_IP}
+    if S.password:
+        extra["ROOT_PASSWORD_OVERRIDE"] = S.password
     res = await run_script("migrate", [ip], progress, extra, on_step)
 
     if res.rc == LOCKED_RC and not res.last_step:
@@ -319,7 +326,8 @@ async def migration(bot: Bot) -> None:
         f"Player: OK (HTTP {html.escape(r.get('player', '?'))})",
         f"DuckDNS: OK ({DOMAIN} -> {ip})",
         "",
-        f"Reminder: the old server <code>{CURRENT_IP}</code> still holds the data with tokens.",
+        f"The old server <code>{CURRENT_IP}</code> still holds the data with tokens. Once everything "
+        "works, tap \"Wipe old server\" in the admin bot on the new server.",
         "",
         f"Handing the admin bot over to <code>{ip}</code>. The next message will come from there.",
     ]), disable_web_page_preview=True)
@@ -398,6 +406,72 @@ async def rollback(bot: Bot) -> None:
     ]) + warn, reply_markup=MENU)
 
 
+# ---------- wipe old server ----------
+
+def known_old_servers() -> list[str]:
+    try:
+        ips = OLD_SERVERS.read_text().split()
+    except FileNotFoundError:
+        return []
+    out = []
+    for ip in ips:
+        if ip not in out and ip != CURRENT_IP:
+            out.append(ip)
+    return out
+
+
+def forget_old_server(ip: str) -> None:
+    rest = [x for x in known_old_servers() if x != ip]
+    OLD_SERVERS.write_text("".join(x + "\n" for x in rest))
+
+
+WIPE_RETRY = kb([("Retry", "wipe_retry"), ("Cancel", "cancel")])
+
+
+async def wipe(bot: Bot) -> None:
+    ip = S.wipe_ip
+    S.mode = "wiping"
+    progress = Progress(bot, f"Wiping old server <code>{ip}</code>")
+    await progress.show()
+    extra = {"ROOT_PASSWORD_OVERRIDE": S.wipe_password} if S.wipe_password else None
+    res = await run_script("wipe", [ip], progress, extra)
+
+    if res.rc == LOCKED_RC and not res.last_step:
+        S.mode = "idle"
+        await bot.send_message(OWNER_ID, "A migration or rollback is running on this server. Try later.",
+                               reply_markup=MENU)
+        return
+    if res.needpass and not res.done:
+        progress.finish_running("failed")
+        await progress.show()
+        S.mode = "wipe_ask_pass"
+        text = (f"The old server <code>{ip}</code> rejected the root password. Log attached.\n\n"
+                "Send its password. I will delete your message right away.")
+        try:
+            await bot.send_document(OWNER_ID, FSInputFile(res.log), caption=text, reply_markup=CANCEL)
+        except TelegramAPIError:
+            await bot.send_message(OWNER_ID, text, reply_markup=CANCEL)
+        return
+    if not res.done:
+        progress.finish_running("failed")
+        await progress.show()
+        S.mode = "wipe_failed"
+        await send_failure(bot, res, "Wiping", 4, WIPE_RETRY)
+        return
+
+    progress.finish_running("done")
+    await progress.show()
+    forget_old_server(ip)
+    S.mode, S.wipe_password = "idle", None
+    await bot.send_message(OWNER_ID, "\n".join([
+        f"Old server <code>{ip}</code> wiped.",
+        "",
+        "Removed: SRS bot, tunnel, player and admin bot with their services, data, Docker volumes, "
+        ".env files with tokens, install leftovers, cloudflared and the SSH keys between the two servers.",
+        "Amnezia and Docker were not touched.",
+    ]), reply_markup=MENU)
+
+
 def start_task(coro) -> None:
     async def guarded():
         try:
@@ -456,10 +530,96 @@ async def cb_migrate(cb: CallbackQuery):
     await cb.message.answer("Send the new server's IP.", reply_markup=CANCEL)
 
 
+@router.callback_query(F.data == "wipe")
+async def cb_wipe(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode in BUSY:
+        await cb.message.answer("A migration, rollback or wipe is already running.")
+        return
+    if S.switched:
+        await cb.message.answer("The last migration stopped after the switchover. Retry it or roll it back first.",
+                                reply_markup=failure_kb())
+        return
+    S.mode, S.wipe_password = "wipe_ask_ip", None
+    known = known_old_servers()
+    rows = [[(f"Wipe {ip}", f"wipeip:{ip}")] for ip in known] + [[("Cancel", "cancel")]]
+    text = "Send the old server's IP."
+    if known:
+        text = "Which old server should I wipe? Tap it, or send another IP."
+    await cb.message.answer(text, reply_markup=kb(*rows))
+
+
+async def ask_wipe_confirm(message: Message, ip: str) -> None:
+    S.wipe_ip, S.mode = ip, "wipe_confirm"
+    await message.answer(
+        f"Wipe <code>{ip}</code>?\n\n"
+        "This deletes the SRS bot, tunnel, player and admin bot there, with all their data, Docker volumes "
+        "and tokens. Amnezia stays. It can't be undone.\n\n"
+        "I will refuse if that server is still the live one.",
+        reply_markup=kb([("Wipe", "wipe_go"), ("Cancel", "cancel")]))
+
+
+@router.callback_query(F.data.startswith("wipeip:"))
+async def cb_wipe_ip(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if S.mode != "wipe_ask_ip":
+        return
+    await ask_wipe_confirm(cb.message, cb.data.split(":", 1)[1])
+
+
+@router.callback_query(F.data == "wipe_go")
+async def cb_wipe_go(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if S.mode != "wipe_confirm":
+        return
+    start_task(wipe(cb.bot))
+
+
+@router.callback_query(F.data == "wipe_retry")
+async def cb_wipe_retry(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if S.mode != "wipe_failed":
+        return
+    start_task(wipe(cb.bot))
+
+
+INSTALL_URL = "https://raw.githubusercontent.com/t6wy26zj95-creator/macaw-admin-/main/install.sh"
+
+
+@router.callback_query(F.data == "update")
+async def cb_update(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode in BUSY or S.switched:
+        await cb.message.answer("Not now: a migration, rollback or wipe is running or unfinished.")
+        return
+    # The installer restarts macaw-admin, so it runs in its own unit.
+    LOG_DIR.mkdir(exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        "systemd-run", "--quiet", "--collect", f"--unit=macaw-update-{int(time.time())}",
+        "--setenv=HOME=/root", "/bin/bash", "-c",
+        f"curl -fsSL {INSTALL_URL} | bash > {LOG_DIR}/update.log 2>&1 || "
+        f"{{ set -a; . {ENV_FILE}; set +a; "
+        f"curl -s https://api.telegram.org/bot$BOT_TOKEN/sendMessage -d chat_id={OWNER_ID} "
+        f"--data-urlencode 'text=Update failed, see {LOG_DIR}/update.log' >/dev/null; }}",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        await cb.message.answer("Could not start the update: " + html.escape(out.decode(errors="replace")[:500]))
+        return
+    await cb.message.answer("Updating from GitHub. The bot restarts and says hello when it's done.")
+
+
 @router.callback_query(F.data == "cancel")
 async def cb_cancel(cb: CallbackQuery):
     await cb.answer()
     await drop_buttons(cb)
+    if S.mode in ("wipe_ask_ip", "wipe_confirm", "wipe_ask_pass", "wipe_failed"):
+        S.mode, S.wipe_password = "idle", None
+        await cb.message.answer("Cancelled.", reply_markup=MENU)
+        return
     if S.mode not in ("ask_ip", "confirm", "ask_pass"):
         return
     if S.switched:
@@ -499,7 +659,7 @@ async def cb_rollback(cb: CallbackQuery):
 
 @router.message()
 async def on_message(message: Message):
-    if S.mode == "ask_pass":
+    if S.mode in ("ask_pass", "wipe_ask_pass"):
         # Delete the password first, before anything else can go wrong.
         try:
             await message.delete()
@@ -508,8 +668,24 @@ async def on_message(message: Message):
         if not message.text or "\n" in message.text:
             await message.answer("Send the password as one line of text.", reply_markup=CANCEL)
             return
+        if S.mode == "wipe_ask_pass":
+            S.wipe_password = message.text
+            start_task(wipe(message.bot))
+            return
         S.password, S.password_saved = message.text, False
         start_task(migration(message.bot))
+        return
+
+    if S.mode == "wipe_ask_ip":
+        try:
+            addr = ipaddress.IPv4Address((message.text or "").strip())
+        except ValueError:
+            await message.answer("That is not a valid IPv4 address. Send it like 203.0.113.10.", reply_markup=CANCEL)
+            return
+        if str(addr) == CURRENT_IP:
+            await message.answer("That is this server, the live one. Send the old server's IP.", reply_markup=CANCEL)
+            return
+        await ask_wipe_confirm(message, str(addr))
         return
 
     if S.mode == "ask_ip":
@@ -532,7 +708,7 @@ async def on_message(message: Message):
         return
 
     if S.mode in BUSY:
-        await message.answer("A migration or rollback is running. Progress is in the message above.")
+        await message.answer("A migration, rollback or wipe is running. Progress is in the message above.")
     elif S.mode == "failed":
         await message.answer("The last run failed.", reply_markup=failure_kb())
     else:
@@ -561,7 +737,11 @@ async def detect_ip() -> str:
 async def on_startup(bot: Bot):
     global CURRENT_IP
     CURRENT_IP = await detect_ip()
-    text = f"Admin bot is running on <code>{CURRENT_IP}</code>"
+    try:
+        version = (BASE / "VERSION").read_text().strip()
+    except FileNotFoundError:
+        version = "unknown"
+    text = f"Admin bot is running on <code>{CURRENT_IP}</code> (version {html.escape(version)})"
     if HANDOFF_FAILED.exists():
         failed_ip = HANDOFF_FAILED.read_text().strip()
         HANDOFF_FAILED.unlink(missing_ok=True)
