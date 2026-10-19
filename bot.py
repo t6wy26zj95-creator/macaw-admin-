@@ -569,11 +569,26 @@ async def create_server(bot: Bot) -> None:
         reply_markup=kb([(f"Migrate to {ip}", f"migrate_to:{ip}")], [("Menu", "menu")]))
 
 
+async def accept_cloud_settings(message: Message, values: dict) -> None:
+    if not values.get("OS_AUTH_URL") or not values.get("OS_USERNAME"):
+        missing = " and ".join(x for x, k in (("the server address (OS_AUTH_URL)", "OS_AUTH_URL"),
+                                              ("the login (hostvds-...)", "OS_USERNAME")) if not values.get(k))
+        await message.answer(f"I couldn't find {missing} in that. Paste the whole openrc text, "
+                             "or the Identity URL and the login.", reply_markup=CANCEL)
+        return
+    S.cloud_tmp, S.mode = values, "cloud_ask_pass"
+    await message.answer("Got it. Now send the API password (tap Show on the HostVDS API page and copy it). "
+                         "I will delete your message right away.", reply_markup=CANCEL)
+
+
 async def show_cloud_setup_start(message: Message) -> None:
     S.mode, S.cloud_tmp, S.cloud_lists = "cloud_ask_openrc", {}, {}
     await message.answer(
         "HostVDS setup (one time).\n\n"
-        "On the HostVDS API page, under OpenStack CLI Client, download the openrc file and send it to me here.",
+        "On the HostVDS API page, under OpenStack CLI Client, open openrc.sh and send it to me here, "
+        "as a file or as pasted text.\n\n"
+        "If that doesn't work: in horizon.hostvds.com go to Project, API Access, and paste the Identity URL "
+        "together with your login (hostvds-...).",
         reply_markup=CANCEL)
 
 
@@ -751,14 +766,7 @@ async def on_document(message: Message):
         except Exception as e:
             await message.answer(f"Could not read that file: {html.escape(str(e))[:200]}", reply_markup=CANCEL)
             return
-        if not values.get("OS_AUTH_URL") or not values.get("OS_USERNAME") or not (
-                values.get("OS_PROJECT_ID") or values.get("OS_PROJECT_NAME")):
-            await message.answer("That doesn't look like an openrc file (no OS_AUTH_URL / OS_USERNAME / project). "
-                                 "Send the openrc file from the HostVDS API page.", reply_markup=CANCEL)
-            return
-        S.cloud_tmp, S.mode = values, "cloud_ask_pass"
-        await message.answer("Got it. Now send the API password (tap Show on the HostVDS API page and copy it). "
-                             "I will delete your message right away.", reply_markup=CANCEL)
+        await accept_cloud_settings(message, values)
         return
     if S.mode in ("ask_pass", "wipe_ask_pass", "email_ask_pass", "cloud_ask_pass"):
         await message.answer("I'm waiting for a password, not a file. Tap Cancel first.", reply_markup=CANCEL)
@@ -1038,6 +1046,10 @@ async def cb_rollback(cb: CallbackQuery):
 
 @router.message()
 async def on_message(message: Message):
+    if S.mode == "cloud_ask_openrc":
+        await accept_cloud_settings(message, parse_openrc(message.text or ""))
+        return
+
     if S.mode == "cloud_ask_pass":
         try:
             await message.delete()
@@ -1050,6 +1062,8 @@ async def on_message(message: Message):
         c = Cloud({**S.cloud_tmp, "OS_PASSWORD": password})
         try:
             await c.auth()
+            if c.cfg.get("OS_PROJECT_ID"):
+                S.cloud_tmp["OS_PROJECT_ID"] = c.cfg["OS_PROJECT_ID"]
             flavors, nets, images = await c.flavors(), await c.networks(), await c.images()
         except Exception as e:
             await message.answer(f"{html.escape(str(e))[:500]}\n\nSend the API password again to retry.",

@@ -38,7 +38,16 @@ def parse_openrc(text: str) -> dict[str, str]:
         out["OS_PROJECT_ID"] = out["OS_TENANT_ID"]
     if "OS_PROJECT_NAME" not in out and "OS_TENANT_NAME" in out:
         out["OS_PROJECT_NAME"] = out["OS_TENANT_NAME"]
-    return {k: v for k, v in out.items() if k in OPENRC_KEYS}
+    out = {k: v for k, v in out.items() if k in OPENRC_KEYS}
+    if "OS_AUTH_URL" not in out or "OS_USERNAME" not in out:
+        # Not an openrc: accept loose text, e.g. the Identity URL from Horizon's API Access page plus the login.
+        url = re.search(r"https?://[^\s'\"]+", text)
+        login = re.search(r"\b(hostvds-[0-9a-fA-F-]{8,})\b", text)
+        if url and "OS_AUTH_URL" not in out:
+            out["OS_AUTH_URL"] = url.group(0)
+        if login and "OS_USERNAME" not in out:
+            out["OS_USERNAME"] = login.group(1)
+    return out
 
 
 def cloud_config(root_password: str, pubkey: str) -> str:
@@ -80,11 +89,33 @@ class Cloud:
     def _session(self):
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
 
-    async def auth(self):
+    def _user(self) -> dict:
         c = self.cfg
         user = {"name": c["OS_USERNAME"], "password": c["OS_PASSWORD"]}
         user["domain"] = ({"id": c["OS_USER_DOMAIN_ID"]} if c.get("OS_USER_DOMAIN_ID")
                           else {"name": c.get("OS_USER_DOMAIN_NAME") or "Default"})
+        return user
+
+    async def discover_project(self):
+        """No project given: log in unscoped and take the account's first project."""
+        body = {"auth": {"identity": {"methods": ["password"], "password": {"user": self._user()}}}}
+        async with self._session() as s:
+            async with s.post(self.auth_url + "/auth/tokens", json=body) as r:
+                if r.status != 201:
+                    hint = " (wrong login or password?)" if r.status == 401 else ""
+                    raise CloudError(f"HostVDS login failed: HTTP {r.status}{hint}")
+                token = r.headers["X-Subject-Token"]
+            async with s.get(self.auth_url + "/auth/projects", headers={"X-Auth-Token": token}) as r:
+                projects = (await r.json(content_type=None) or {}).get("projects", [])
+        if not projects:
+            raise CloudError("Logged in, but the account has no project")
+        self.cfg["OS_PROJECT_ID"] = projects[0]["id"]
+
+    async def auth(self):
+        c = self.cfg
+        if not c.get("OS_PROJECT_ID") and not c.get("OS_PROJECT_NAME"):
+            await self.discover_project()
+        user = self._user()
         if c.get("OS_PROJECT_ID"):
             project = {"id": c["OS_PROJECT_ID"]}
         else:
