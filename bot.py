@@ -11,6 +11,9 @@ import logging
 import os
 import re
 import signal
+import smtplib
+import ssl
+from email.message import EmailMessage
 import socket
 import subprocess
 import time
@@ -60,12 +63,17 @@ DOMAIN = CFG.get("DUCKDNS_DOMAIN", "macawp3") + ".duckdns.org"
 
 
 def save_password(password: str) -> None:
-    """Replace ROOT_PASSWORD in .env (single-quoted so any characters survive `source`)."""
-    quoted = "'" + password.replace("'", "'\\''") + "'"
+    set_env("ROOT_PASSWORD", password)
+
+
+def set_env(key: str, value: str) -> None:
+    """Set KEY in .env (single-quoted so any characters survive `source`)."""
+    quoted = "'" + value.replace("'", "'\\''") + "'"
     lines = ENV_FILE.read_text().splitlines()
-    newline = f"ROOT_PASSWORD={quoted}"
+    newline = f"{key}={quoted}"
+    CFG[key] = value
     for i, line in enumerate(lines):
-        if line.startswith("ROOT_PASSWORD="):
+        if line.startswith(f"{key}="):
             lines[i] = newline
             break
     else:
@@ -86,7 +94,8 @@ def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     ])
 
 
-MENU = kb([("Migrate to a new server", "migrate")], [("Wipe old server", "wipe")], [("Update admin bot", "update")])
+MENU = kb([("Migrate to a new server", "migrate")], [("Wipe old server", "wipe")],
+          [("Email settings", "email")], [("Update admin bot", "update")])
 CANCEL = kb([("Cancel", "cancel")])
 CONFIRM = kb([("Start", "start"), ("Cancel", "cancel")])
 
@@ -104,6 +113,7 @@ def failure_kb() -> InlineKeyboardMarkup:
 class State:
     # idle | ask_ip | confirm | running | ask_pass | failed | rolling_back | handoff
     # wipe_ask_ip | wipe_confirm | wiping | wipe_ask_pass | wipe_failed
+    # email_ask_user | email_ask_pass | email_ask_to
     mode: str = "idle"
     ip: str = ""
     password: str | None = None   # override sent via NEEDPASS
@@ -111,6 +121,9 @@ class State:
     switched: bool = False        # some attempt reached step 6: services here are stopped
     wipe_ip: str = ""
     wipe_password: str | None = None
+    email_user: str = ""
+    email_password: str = ""
+    pending_file: tuple[str, str] | None = None  # (file_id, file_name) waiting for Send
     task: asyncio.Task | None = None
 
 
@@ -487,6 +500,43 @@ def start_task(coro) -> None:
     S.task = asyncio.create_task(guarded())
 
 
+# ---------- emailing files ----------
+# Telegram is blocked for some people, so files (VPN configs) can be forwarded by email.
+# Sender, app password and recipient are set in the bot (Email settings) and kept in .env.
+
+SMTP_HOSTS = {
+    "gmail.com": "smtp.gmail.com", "googlemail.com": "smtp.gmail.com",
+    "yandex.ru": "smtp.yandex.ru", "ya.ru": "smtp.yandex.ru", "yandex.com": "smtp.yandex.ru",
+    "mail.ru": "smtp.mail.ru", "inbox.ru": "smtp.mail.ru", "list.ru": "smtp.mail.ru", "bk.ru": "smtp.mail.ru",
+}
+APP_PASSWORD_HELP = {
+    "smtp.gmail.com": "a Google app password: turn on 2-Step Verification, then create one at "
+                      "myaccount.google.com/apppasswords (16 letters).",
+    "smtp.yandex.ru": "a Yandex app password for Mail: id.yandex.ru, Security, App passwords.",
+    "smtp.mail.ru": "a Mail.ru app password: account settings, Security, Passwords for external apps.",
+}
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def smtp_send(user: str, password: str, to: str | None = None,
+              filename: str | None = None, data: bytes | None = None) -> None:
+    """Log in over SSL; send the file if one is given (otherwise only check the login)."""
+    host = SMTP_HOSTS[user.rsplit("@", 1)[1].lower()]
+    with smtplib.SMTP_SSL(host, 465, context=ssl.create_default_context(), timeout=30) as smtp:
+        smtp.login(user, password)
+        if data is None:
+            return
+        msg = EmailMessage()
+        msg["From"], msg["To"], msg["Subject"] = user, to, f"Config: {filename}"
+        msg.set_content(f"File attached: {filename}\n")
+        msg.add_attachment(data, maintype="application", subtype="octet-stream", filename=filename)
+        smtp.send_message(msg)
+
+
+def email_ready() -> bool:
+    return all(CFG.get(k) for k in ("SMTP_USER", "SMTP_PASSWORD", "MAIL_TO"))
+
+
 # ---------- handlers ----------
 
 router = Router()
@@ -586,6 +636,66 @@ async def cb_wipe_retry(cb: CallbackQuery):
     start_task(wipe(cb.bot))
 
 
+@router.callback_query(F.data == "email")
+async def cb_email(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode in BUSY:
+        await cb.message.answer("Not now: a migration, rollback or wipe is running.")
+        return
+    S.mode = "email_ask_user"
+    text = ""
+    if email_ready():
+        text = (f"Now: files go from {html.escape(CFG['SMTP_USER'])} to {html.escape(CFG['MAIL_TO'])}.\n"
+                "To change it, go through the steps again.\n\n")
+    await cb.message.answer(text + "Send the address to send from (Gmail, Yandex or Mail.ru).", reply_markup=CANCEL)
+
+
+@router.message(F.document)
+async def on_document(message: Message):
+    if S.mode in ("ask_pass", "wipe_ask_pass", "email_ask_pass"):
+        await message.answer("I'm waiting for a password, not a file. Tap Cancel first.", reply_markup=CANCEL)
+        return
+    if not email_ready():
+        await message.answer("Email isn't set up yet. Tap Email settings, then send the file again.",
+                             reply_markup=MENU)
+        return
+    doc = message.document
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await message.answer("That file is over 20 MB, too big for a Telegram bot to download.")
+        return
+    S.pending_file = (doc.file_id, doc.file_name or "config.conf")
+    await message.answer(f"Email <code>{html.escape(S.pending_file[1])}</code> to "
+                         f"{html.escape(CFG['MAIL_TO'])}?",
+                         reply_markup=kb([("Send", "email_send"), ("Cancel", "email_drop")]))
+
+
+@router.callback_query(F.data == "email_drop")
+async def cb_email_drop(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    S.pending_file = None
+    await cb.message.answer("Not sent.")
+
+
+@router.callback_query(F.data == "email_send")
+async def cb_email_send(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if not S.pending_file or not email_ready():
+        return
+    file_id, name = S.pending_file
+    S.pending_file = None
+    try:
+        buf = await cb.bot.download(file_id)
+        await asyncio.to_thread(smtp_send, CFG["SMTP_USER"], CFG["SMTP_PASSWORD"], CFG["MAIL_TO"],
+                                name, buf.read())
+    except Exception as e:
+        log.warning("email failed: %r", e)
+        await cb.message.answer(f"Could not send <code>{html.escape(name)}</code>: {html.escape(str(e))[:300]}")
+        return
+    await cb.message.answer(f"Sent <code>{html.escape(name)}</code> to {html.escape(CFG['MAIL_TO'])}.")
+
+
 INSTALL_URL = "https://raw.githubusercontent.com/t6wy26zj95-creator/macaw-admin-/main/install.sh"
 
 
@@ -616,8 +726,9 @@ async def cb_update(cb: CallbackQuery):
 async def cb_cancel(cb: CallbackQuery):
     await cb.answer()
     await drop_buttons(cb)
-    if S.mode in ("wipe_ask_ip", "wipe_confirm", "wipe_ask_pass", "wipe_failed"):
-        S.mode, S.wipe_password = "idle", None
+    if S.mode in ("wipe_ask_ip", "wipe_confirm", "wipe_ask_pass", "wipe_failed",
+                  "email_ask_user", "email_ask_pass", "email_ask_to"):
+        S.mode, S.wipe_password, S.email_password = "idle", None, ""
         await cb.message.answer("Cancelled.", reply_markup=MENU)
         return
     if S.mode not in ("ask_ip", "confirm", "ask_pass"):
@@ -659,6 +770,53 @@ async def cb_rollback(cb: CallbackQuery):
 
 @router.message()
 async def on_message(message: Message):
+    if S.mode == "email_ask_pass":
+        try:
+            await message.delete()
+        except TelegramAPIError:
+            await message.answer("I could not delete your message with the password. Please delete it yourself.")
+        password = (message.text or "").strip()
+        if not password:
+            await message.answer("Send the app password as text.", reply_markup=CANCEL)
+            return
+        try:
+            await asyncio.to_thread(smtp_send, S.email_user, password)
+        except smtplib.SMTPAuthenticationError:
+            await message.answer("The mail server rejected that password. It must be an app password, "
+                                 "not your normal one. Send it again.", reply_markup=CANCEL)
+            return
+        except Exception as e:
+            await message.answer(f"Could not reach the mail server: {html.escape(str(e))[:300]}\n\n"
+                                 "Send the app password again to retry.", reply_markup=CANCEL)
+            return
+        S.email_password, S.mode = password, "email_ask_to"
+        await message.answer("Login works. Now send the address the files should go to.", reply_markup=CANCEL)
+        return
+
+    if S.mode == "email_ask_to":
+        to = (message.text or "").strip()
+        if not EMAIL_RE.match(to):
+            await message.answer("That doesn't look like an email address. Send it again.", reply_markup=CANCEL)
+            return
+        set_env("SMTP_USER", S.email_user)
+        set_env("SMTP_PASSWORD", S.email_password)
+        set_env("MAIL_TO", to)
+        S.email_password, S.mode = "", "idle"
+        await message.answer(f"Email is set up. Send me a file and I'll offer to email it from "
+                             f"{html.escape(S.email_user)} to {html.escape(to)}.", reply_markup=MENU)
+        return
+
+    if S.mode == "email_ask_user":
+        addr = (message.text or "").strip().lower()
+        if not EMAIL_RE.match(addr) or addr.rsplit("@", 1)[1] not in SMTP_HOSTS:
+            await message.answer("Send a Gmail, Yandex or Mail.ru address, like name@gmail.com.", reply_markup=CANCEL)
+            return
+        S.email_user, S.mode = addr, "email_ask_pass"
+        host = SMTP_HOSTS[addr.rsplit("@", 1)[1]]
+        await message.answer(f"Now send {APP_PASSWORD_HELP[host]}\n\nI will delete your message right away.",
+                             reply_markup=CANCEL)
+        return
+
     if S.mode in ("ask_pass", "wipe_ask_pass"):
         # Delete the password first, before anything else can go wrong.
         try:

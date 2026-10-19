@@ -25,6 +25,10 @@ After a migration, tap "Wipe old server" in the admin bot (now on the new server
 It removes the SRS bot, tunnel, player and admin bot with their data, Docker volumes, `.env` files with tokens, install leftovers, cloudflared, and the SSH keys between the two servers. Amnezia and Docker stay.
 It refuses to wipe the server it runs on, a server that DuckDNS still points to, or a server where the SRS bot or admin bot is still running.
 
+## Emailing a file
+
+For people who can't use Telegram: tap "Email settings" once and set your mailbox (Gmail, Yandex or Mail.ru, with an app password) and the recipient. After that, send the bot a file, tap Send, and it is emailed from your mailbox. The settings live in `.env` and move with the bot.
+
 ## Files
 
 - `bot.py`: the bot (Python 3.12, aiogram 3, long polling). Only answers `OWNER_ID`.
