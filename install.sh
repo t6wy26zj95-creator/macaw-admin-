@@ -11,6 +11,15 @@ REPO_RAW="https://raw.githubusercontent.com/t6wy26zj95-creator/macaw-admin-/main
 DIR=/opt/macaw-admin
 
 [ "$(id -u)" = 0 ] || { echo "Run as root."; exit 1; }
+# After a migration the old server has macaw-admin disabled. Don't bring a second copy back there:
+# two bots polling one token break each other.
+if [ -f /etc/systemd/system/macaw-admin.service ] && [ "${FORCE:-}" != 1 ] \
+   && [ "$(systemctl is-enabled macaw-admin 2>/dev/null || true)" = disabled ]; then
+  echo "The admin bot was moved off this server after a migration, so it stays off here."
+  echo "Run this command on the server it runs on now, or tap Update admin bot in Telegram."
+  echo "To install here anyway: curl -fsSL <same URL> | FORCE=1 bash"
+  exit 1
+fi
 
 echo "== Installing packages"
 export DEBIAN_FRONTEND=noninteractive
