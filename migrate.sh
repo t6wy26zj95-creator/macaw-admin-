@@ -28,14 +28,27 @@ step "2/8 SSH key"
 ssh-keygen -R "$NEW" >/dev/null 2>&1 || true
 if ! ssh -n $SSH_OPTS root@"$NEW" true 2>/dev/null; then
   command -v sshpass >/dev/null || { $APT update >/dev/null; $APT install sshpass >/dev/null; }
+  # Which login methods does the server offer? (no password sent here)
+  methods=$(ssh -n -o BatchMode=yes -o PreferredAuthentications=none -o ConnectTimeout=30 \
+    -o StrictHostKeyChecking=accept-new root@"$NEW" true 2>&1 | grep -o 'Permission denied (.*)' || true)
+  echo "server login methods: ${methods:-unknown}"
+  case "$methods" in
+    *password*|*keyboard-interactive*|"") ;;
+    *) fail "The new server doesn't accept password logins for root ($methods). Enable them in the hosting panel, or reinstall the server with a root password, then tap Retry" ;;
+  esac
   rc=0
-  SSHPASS="$ROOT_PASSWORD" timeout 120 sshpass -e ssh-copy-id -i /root/.ssh/id_ed25519.pub \
-    -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 root@"$NEW" >/dev/null 2>&1 || rc=$?
+  out=$(SSHPASS="$ROOT_PASSWORD" timeout 120 sshpass -e ssh-copy-id -i /root/.ssh/id_ed25519.pub \
+    -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 root@"$NEW" 2>&1) || rc=$?
+  printf '%s\n' "$out" | sed 's/^/  ssh-copy-id: /'
   echo "ssh-copy-id exit code: $rc"
   [ $rc -eq 124 ] && fail "Password login to $NEW timed out"
   [ $rc -eq 6 ] && fail "Host key problem for $NEW"
-  # Wrong password, or the host forces a password change on first login.
-  [ $rc -ne 0 ] && { echo "##NEEDPASS"; exit 3; }
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qiE 'expired|must change|change your password|new password|current password'; then
+    fail "The new server demands a password change on first login. Log in once (hosting panel console or SSH), set the standard password, then tap Retry"
+  fi
+  # sshpass code 5 = the server rejected the password.
+  [ $rc -eq 5 ] && { echo "##NEEDPASS"; exit 3; }
+  [ $rc -ne 0 ] && fail "Password login to $NEW failed (code $rc), see the log"
   new true || fail "Key installed, but key login doesn't work"
 fi
 

@@ -291,12 +291,12 @@ async def migration(bot: Bot) -> None:
         progress.finish_running("failed")
         await progress.show()
         S.mode = "ask_pass"
-        await bot.send_message(
-            OWNER_ID,
-            f"The root password didn't work on <code>{ip}</code>. The host may also demand a "
-            "password change on first login: if so, set the standard password in the hosting panel.\n\n"
-            "Send the password. I will delete your message right away.",
-            reply_markup=CANCEL)
+        text = (f"The new server <code>{ip}</code> rejected the root password. Log attached.\n\n"
+                "Send the password. I will delete your message right away.")
+        try:
+            await bot.send_document(OWNER_ID, FSInputFile(res.log), caption=text, reply_markup=CANCEL)
+        except TelegramAPIError:
+            await bot.send_message(OWNER_ID, text, reply_markup=CANCEL)
         return
 
     if not res.done:
