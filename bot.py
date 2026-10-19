@@ -24,7 +24,7 @@ from pathlib import Path
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 
-from cloud import OPENRC_KEYS, Cloud, CloudError, cloud_config, parse_openrc
+from cloud import OPENRC_KEYS, Cloud, CloudError, cloud_config, find_auth_url, parse_openrc
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -570,11 +570,9 @@ async def create_server(bot: Bot) -> None:
 
 
 async def accept_cloud_settings(message: Message, values: dict) -> None:
-    if not values.get("OS_AUTH_URL") or not values.get("OS_USERNAME"):
-        missing = " and ".join(x for x, k in (("the server address (OS_AUTH_URL)", "OS_AUTH_URL"),
-                                              ("the login (hostvds-...)", "OS_USERNAME")) if not values.get(k))
-        await message.answer(f"I couldn't find {missing} in that. Paste the whole openrc text, "
-                             "or the Identity URL and the login.", reply_markup=CANCEL)
+    if not values.get("OS_USERNAME"):
+        await message.answer("I couldn't find the login in that. It starts with hostvds- and is at the top "
+                             "of the HostVDS API page. Copy it and send it here.", reply_markup=CANCEL)
         return
     S.cloud_tmp, S.mode = values, "cloud_ask_pass"
     await message.answer("Got it. Now send the API password (tap Show on the HostVDS API page and copy it). "
@@ -585,10 +583,9 @@ async def show_cloud_setup_start(message: Message) -> None:
     S.mode, S.cloud_tmp, S.cloud_lists = "cloud_ask_openrc", {}, {}
     await message.answer(
         "HostVDS setup (one time).\n\n"
-        "On the HostVDS API page, under OpenStack CLI Client, open openrc.sh and send it to me here, "
-        "as a file or as pasted text.\n\n"
-        "If that doesn't work: in horizon.hostvds.com go to Project, API Access, and paste the Identity URL "
-        "together with your login (hostvds-...).",
+        "Open the HostVDS API page, copy your login (it starts with hostvds-) and send it here. "
+        "Then I will ask for the password.\n\n"
+        "You can also send the openrc.sh file instead, if you have it.",
         reply_markup=CANCEL)
 
 
@@ -1059,8 +1056,17 @@ async def on_message(message: Message):
         if not password:
             await message.answer("Send the API password as text.", reply_markup=CANCEL)
             return
-        c = Cloud({**S.cloud_tmp, "OS_PASSWORD": password})
         try:
+            if not S.cloud_tmp.get("OS_AUTH_URL"):
+                note = await message.answer("Looking up the HostVDS API address...")
+                found = await find_auth_url(S.cloud_tmp["OS_USERNAME"], password, log.info)
+                found.pop("OS_USERNAME", None)
+                S.cloud_tmp.update(found)
+                try:
+                    await note.delete()
+                except TelegramAPIError:
+                    pass
+            c = Cloud({**S.cloud_tmp, "OS_PASSWORD": password})
             await c.auth()
             if c.cfg.get("OS_PROJECT_ID"):
                 S.cloud_tmp["OS_PROJECT_ID"] = c.cfg["OS_PROJECT_ID"]

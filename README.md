@@ -27,7 +27,7 @@ It refuses to wipe the server it runs on, a server that DuckDNS still points to,
 
 ## HostVDS
 
-The first tap on "New server at HostVDS" runs a one-time setup: send the openrc file from the HostVDS API page, then the API password (deleted from the chat), then pick the plan (HostVDS-2 is the 3 euro one) and the IPv4+IPv6 network. The bot finds Ubuntu 24.04 itself.
+The first tap on "New server at HostVDS" runs a one-time setup: send the login from the HostVDS API page (hostvds-...), then the API password (deleted from the chat). The bot logs in to horizon.hostvds.com and finds the API address itself; sending the openrc file also works, then pick the plan (HostVDS-2 is the 3 euro one) and the IPv4+IPv6 network. The bot finds Ubuntu 24.04 itself.
 New servers get the standard root password and this server's SSH key through cloud-init.
 After "Wipe old server" the bot offers to delete that server at HostVDS. It refuses to delete the live server.
 

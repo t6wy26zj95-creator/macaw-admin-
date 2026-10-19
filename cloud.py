@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import re
+from html.parser import HTMLParser
 
 import aiohttp
 
@@ -48,6 +49,119 @@ def parse_openrc(text: str) -> dict[str, str]:
         if login and "OS_USERNAME" not in out:
             out["OS_USERNAME"] = login.group(1)
     return out
+
+
+HORIZON_BASES = ("https://horizon.hostvds.com", "https://horizon.hostvds.com/dashboard")
+OPENRC_PATHS = ("/project/api_access/openrc/", "/project/api_access/openrcv3/",
+                "/project/access_and_security/api_access/openrcv3/", "/project/access_and_security/api_access/openrc/")
+# Last resort if Horizon can't be read: common Keystone addresses.
+KEYSTONE_GUESSES = ("https://keystone.hostvds.com/v3", "https://keystone.hostvds.com:5000/v3",
+                    "https://horizon.hostvds.com:5000/v3", "https://horizon.hostvds.com/identity/v3",
+                    "https://api.hostvds.com:5000/v3", "https://identity.hostvds.com/v3",
+                    "https://openstack.hostvds.com:5000/v3", "https://cloud.hostvds.com:5000/v3")
+
+
+class _LoginForm(HTMLParser):
+    """Collects the hidden inputs and the first option of each <select> in Horizon's login form."""
+    def __init__(self):
+        super().__init__()
+        self.fields, self.names, self._select = {}, set(), None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "input" and a.get("name"):
+            self.names.add(a["name"])
+            if a.get("type") == "hidden":
+                self.fields[a["name"]] = a.get("value") or ""
+        elif tag == "select" and a.get("name"):
+            self._select = a["name"]
+            self.names.add(a["name"])
+        elif tag == "option" and self._select and self._select not in self.fields:
+            self.fields[self._select] = a.get("value") or ""
+
+    def handle_endtag(self, tag):
+        if tag == "select":
+            self._select = None
+
+
+async def _openrc_via_horizon(username: str, password: str, log=None) -> dict[str, str]:
+    """Log in to Horizon like a browser and download the openrc file from Project > API Access."""
+    jar = aiohttp.CookieJar(unsafe=True)
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(cookie_jar=jar, timeout=timeout,
+                                     headers={"User-Agent": "Mozilla/5.0 macaw-admin"}) as s:
+        for base in HORIZON_BASES:
+            login = base + "/auth/login/"
+            try:
+                async with s.get(login) as r:
+                    page = await r.text()
+                    status = r.status
+            except Exception as e:
+                if log:
+                    log(f"horizon {login}: {e!r}")
+                continue
+            if status != 200 or "csrfmiddlewaretoken" not in page:
+                if log:
+                    log(f"horizon {login}: HTTP {status}, no login form")
+                continue
+            form = _LoginForm()
+            form.feed(page)
+            data = dict(form.fields)
+            data.update(username=username, password=password)
+            if "domain" in form.names and not data.get("domain"):
+                data["domain"] = "Default"
+            data.setdefault("next", "")
+            region = data.get("region", "")  # often the Keystone URL itself
+            async with s.post(login, data=data, headers={"Referer": login}) as r:
+                after = await r.text()
+                if "csrfmiddlewaretoken" in after and 'name="password"' in after and "/auth/login" in str(r.url):
+                    raise CloudError("HostVDS rejected the login or password")
+            for path in OPENRC_PATHS:
+                async with s.get(base + path) as r:
+                    if r.status != 200:
+                        continue
+                    values = parse_openrc(await r.text())
+                if values.get("OS_AUTH_URL"):
+                    return values
+            # No openrc download: read the Identity endpoint from the API Access table.
+            for path in ("/project/api_access/", "/project/access_and_security/"):
+                async with s.get(base + path) as r:
+                    text = await r.text() if r.status == 200 else ""
+                m = re.search(r"Identity.{0,400}?(https?://[^\s<\"']+)", text, re.S | re.I)
+                if m:
+                    return {"OS_AUTH_URL": m.group(1)}
+            if region.startswith("http"):
+                return {"OS_AUTH_URL": region}
+    return {}
+
+
+async def _probe_keystone(url: str) -> bool:
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+            async with s.get(url) as r:
+                data = json.loads(await r.text())
+        return isinstance(data, dict) and "version" in data
+    except Exception:
+        return False
+
+
+async def find_auth_url(username: str, password: str, log=None) -> dict[str, str]:
+    """Only the login and password are known: find the Keystone address (and project) ourselves."""
+    try:
+        values = await _openrc_via_horizon(username, password, log)
+    except CloudError:
+        raise
+    except Exception as e:
+        values = {}
+        if log:
+            log(f"horizon lookup failed: {e!r}")
+    if values.get("OS_AUTH_URL"):
+        return values
+    for url in KEYSTONE_GUESSES:
+        if await _probe_keystone(url):
+            return {"OS_AUTH_URL": url}
+    raise CloudError("I couldn't find the HostVDS API address with just the login. "
+                     "Send me the openrc.sh file instead (see the steps in the setup message).")
 
 
 def cloud_config(root_password: str, pubkey: str) -> str:
