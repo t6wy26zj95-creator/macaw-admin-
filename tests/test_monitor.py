@@ -63,9 +63,10 @@ class Decide(unittest.TestCase):
 class FakeCheckHost(CheckHost):
     """Answers like check-host.net; `blocked` lists test points that can't reach IP."""
 
-    def __init__(self, blocked=(), no_ref=()):
+    def __init__(self, blocked=(), no_ref=(), limited=0):
         super().__init__("ru")
         self.blocked, self.no_ref, self.reqs = set(blocked), set(no_ref), {}
+        self.limited, self.starts = limited, 0  # first `limited` check requests get limit_exceeded
 
     async def _get(self, s, path, params=None):
         if path == "/nodes/hosts":
@@ -81,6 +82,9 @@ class FakeCheckHost(CheckHost):
                 else:
                     out[n] = TCP_FAIL if n in self.blocked else TCP_OK
             return out
+        self.starts += 1
+        if self.starts <= self.limited:
+            return {"error": "limit_exceeded"}
         kind = path.removeprefix("/check-")
         host = dict(params)["host"]
         nodes = [v for k, v in params if k == "node"]
@@ -119,6 +123,27 @@ class Client(unittest.TestCase):
                                          no_ref={"ru3.node.check-host.net"}))
         self.assertEqual(r.verdict, "partial")  # ru3 ignored, ru1 down, ru2 up
         self.assertEqual(len(r.local()), 2)
+
+    def test_retries_after_rate_limit(self):
+        fake = FakeCheckHost(limited=2)
+        self.assertEqual(self.run_check(fake).verdict, "ok")
+        self.assertEqual(fake.starts, 5)  # 2 refused + ping, reference, port 22
+
+    def test_gives_up_when_still_rate_limited(self):
+        r = self.run_check(FakeCheckHost(limited=99))
+        self.assertEqual(r.verdict, "unknown")
+        self.assertIn("rate limiting", r.error)
+
+    def test_recent_round_is_reused(self):
+        fake = FakeCheckHost()
+
+        async def twice():
+            a = await fake.run(IP, [22], "ya.ru:443", max_age=120)
+            b = await fake.run(IP, [22], "ya.ru:443", max_age=120)
+            return a, b
+        a, b = asyncio.run(twice())
+        self.assertIs(a, b)
+        self.assertEqual(fake.starts, 3)
 
     def test_api_failure_is_unknown(self):
         class Broken(CheckHost):
