@@ -112,8 +112,11 @@ UNIT
 systemctl daemon-reload
 systemctl enable macaw-admin >/dev/null 2>&1
 systemctl restart macaw-admin
-sleep 5
-if systemctl is-active --quiet macaw-admin; then
+# A bot that crashes on start is restarted every 5 s and can look "active" at any single moment,
+# so wait a bit and also require that systemd hasn't had to restart it.
+sleep 15
+if systemctl is-active --quiet macaw-admin \
+   && [ "$(systemctl show -p NRestarts --value macaw-admin 2>/dev/null || echo 0)" = 0 ]; then
   echo
   echo "Done. The admin bot is running and should message you in Telegram now."
   echo "No message? Open the bot, send /start, and check: journalctl -u macaw-admin -n 50"

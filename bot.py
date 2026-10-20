@@ -923,7 +923,12 @@ async def cb_email_send(cb: CallbackQuery):
     await cb.message.answer(f"Sent <code>{html.escape(name)}</code> to {html.escape(CFG['MAIL_TO'])}.")
 
 
-INSTALL_URL = "https://raw.githubusercontent.com/t6wy26zj95-creator/macaw-admin-/main/install.sh"
+# raw.githubusercontent.com caches "main" for up to 5 minutes, which once paired a stale installer
+# with fresh bot code. So the installer is fetched from the latest commit, like the files it installs.
+INSTALL_URL = ("https://raw.githubusercontent.com/t6wy26zj95-creator/macaw-admin-/"
+               "$(sha=$(curl -fsSL -H 'Accept: application/vnd.github.sha' "
+               "https://api.github.com/repos/t6wy26zj95-creator/macaw-admin-/commits/main 2>/dev/null); "
+               "case $sha in *[!0-9a-f]*|'') echo main;; *) echo $sha;; esac)/install.sh")
 
 
 @router.callback_query(F.data == "update")
