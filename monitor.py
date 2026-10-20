@@ -29,6 +29,8 @@ CONTROL_COUNTRIES = ("de", "nl", "fi", "fr", "pl", "se", "gb", "ch", "at", "cz")
 MAX_LOCAL = 6
 MAX_CONTROL = 3
 RESULT_WAIT = 60  # seconds to wait for test points to report
+REQUEST_GAP = 3  # seconds between check requests
+LIMIT_RETRY_WAITS = (20, 40)  # seconds to wait before retrying after "limit_exceeded"
 COUNTRY_NAMES = {"ru": "Russia", "by": "Belarus", "ir": "Iran", "cn": "China", "tr": "Turkey",
                  "kz": "Kazakhstan", "uz": "Uzbekistan", "tm": "Turkmenistan"}
 DEFAULT_REFERENCE = {"ru": "ya.ru:443", "by": "ya.ru:443"}
@@ -132,6 +134,9 @@ class CheckHost:
         self.country = country.lower()
         self._nodes: dict[str, tuple[str, str]] = {}  # node -> (country code, city)
         self._nodes_at = 0.0
+        self._lock = asyncio.Lock()  # one round at a time: the free API has a rate limit
+        self._last: Round | None = None
+        self._last_at = 0.0
 
     async def _get(self, s: aiohttp.ClientSession, path: str, params=None):
         async with s.get(API + path, params=params, headers=HEADERS) as r:
@@ -168,8 +173,14 @@ class CheckHost:
 
     async def _check(self, s: aiohttp.ClientSession, kind: str, host: str, nodes: list[str]) -> dict:
         params = [("host", host)] + [("node", n) for n in nodes]
-        start = await self._get(s, f"/check-{kind}", params)
+        for wait in LIMIT_RETRY_WAITS + (None,):
+            start = await self._get(s, f"/check-{kind}", params)
+            if start.get("error") != "limit_exceeded" or wait is None:
+                break
+            await asyncio.sleep(wait)
         rid = start.get("request_id")
+        if start.get("error") == "limit_exceeded":
+            raise CheckError("check-host.net is rate limiting this server, try again in a few minutes")
         if not rid:
             raise CheckError(f"check-host.net refused the {kind} check: {str(start)[:200]}")
         for name, info in (start.get("nodes") or {}).items():
@@ -184,7 +195,16 @@ class CheckHost:
                 break
         return res
 
-    async def run(self, ip: str, ports: list[int], reference: str) -> Round:
+    async def run(self, ip: str, ports: list[int], reference: str, max_age: float = 0) -> Round:
+        """Run one round, or return the last one if it finished less than max_age seconds ago."""
+        async with self._lock:
+            if self._last and time.time() - self._last_at < max_age:
+                return self._last
+            r = await self._run(ip, ports, reference)
+            self._last, self._last_at = r, time.time()
+            return r
+
+    async def _run(self, ip: str, ports: list[int], reference: str) -> Round:
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
                 local, control = await self.pick_nodes(s)
@@ -192,9 +212,14 @@ class CheckHost:
                     return Round("unknown", error=f"check-host.net has no test points in "
                                                   f"{country_name(self.country)}")
                 nodes = local + control
-                jobs = [self._check(s, "ping", ip, nodes), self._check(s, "tcp", reference, nodes)]
-                jobs += [self._check(s, "tcp", f"{ip}:{p}", nodes) for p in ports]
-                ping, ref, *tcps = await asyncio.gather(*jobs)
+                # One request at a time, a little apart: parallel ones trip check-host.net's rate limit.
+                ping = await self._check(s, "ping", ip, nodes)
+                await asyncio.sleep(REQUEST_GAP)
+                ref = await self._check(s, "tcp", reference, nodes)
+                tcps = []
+                for p in ports:
+                    await asyncio.sleep(REQUEST_GAP)
+                    tcps.append(await self._check(s, "tcp", f"{ip}:{p}", nodes))
         except Exception as e:
             return Round("unknown", error=str(e) or type(e).__name__)
         results = []

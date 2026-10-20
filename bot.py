@@ -678,7 +678,9 @@ TRACKER = Tracker(BASE / "monitor-state.json")
 
 
 async def run_block_check() -> Round:
-    return await CHECKER.run(CURRENT_IP, mon_ports(), mon_reference())
+    # A round that finished in the last 2 minutes is reused, so a tap right after the timed
+    # check (or the other way round) doesn't send check-host.net a second batch of requests.
+    return await CHECKER.run(CURRENT_IP, mon_ports(), mon_reference(), max_age=120)
 
 
 def places(nodes, ok: bool) -> str:
@@ -978,7 +980,7 @@ async def cb_blockcheck(cb: CallbackQuery):
         return
     async with BLOCK_CHECK_BUSY:
         note = await cb.message.answer(f"Asking test points in {country_name(mon_country())} and abroad to reach "
-                                       f"<code>{CURRENT_IP}</code>. This takes up to a minute...")
+                                       f"<code>{CURRENT_IP}</code>. This takes a minute or two...")
         r = await run_block_check()
         try:
             await note.delete()
