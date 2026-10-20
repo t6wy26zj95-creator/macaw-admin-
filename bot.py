@@ -25,6 +25,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 
 from cloud import OPENRC_KEYS, Cloud, CloudError, cloud_config, find_auth_url, parse_openrc
+from monitor import DEFAULT_REFERENCE, CheckHost, Round, Tracker, country_name
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -97,7 +98,8 @@ def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 
 
 MENU = kb([("New server at HostVDS", "newsrv")], [("Migrate to a new server", "migrate")],
-          [("Wipe old server", "wipe")], [("Email settings", "email")], [("Update admin bot", "update")])
+          [("Wipe old server", "wipe")], [("Block check", "blockcheck")], [("Email settings", "email")],
+          [("Update admin bot", "update")])
 CANCEL = kb([("Cancel", "cancel")])
 CONFIRM = kb([("Start", "start"), ("Cancel", "cancel")])
 
@@ -641,6 +643,118 @@ def email_ready() -> bool:
     return all(CFG.get(k) for k in ("SMTP_USER", "SMTP_PASSWORD", "MAIL_TO"))
 
 
+# ---------- block monitor ----------
+# Test points inside the country (check-host.net) try to reach this server every few minutes.
+# Settings in .env (all optional): MONITOR_ENABLED (1/0), MONITOR_COUNTRY (ru),
+# MONITOR_PORTS (22; add the XRay port, e.g. "22 443"), MONITOR_INTERVAL (minutes, 10),
+# MONITOR_REFERENCE (a site that works in that country, ya.ru:443 for Russia).
+
+def mon_country() -> str:
+    return (CFG.get("MONITOR_COUNTRY") or "ru").strip().lower()
+
+
+def mon_ports() -> list[int]:
+    ports = [int(p) for p in re.findall(r"\d+", CFG.get("MONITOR_PORTS") or "22") if 0 < int(p) < 65536]
+    return ports or [22]
+
+
+def mon_interval() -> int:
+    try:
+        return max(5, int(CFG.get("MONITOR_INTERVAL") or 10))
+    except ValueError:
+        return 10
+
+
+def mon_reference() -> str:
+    return CFG.get("MONITOR_REFERENCE") or DEFAULT_REFERENCE.get(mon_country(), "www.google.com:443")
+
+
+def mon_enabled() -> bool:
+    return CFG.get("MONITOR_ENABLED", "1") != "0"
+
+
+CHECKER = CheckHost(mon_country())
+TRACKER = Tracker(BASE / "monitor-state.json")
+
+
+async def run_block_check() -> Round:
+    return await CHECKER.run(CURRENT_IP, mon_ports(), mon_reference())
+
+
+def places(nodes, ok: bool) -> str:
+    return ", ".join(html.escape(n.place) for n in nodes if bool(n.target_ok) == ok) or "none"
+
+
+def round_details(r: Round) -> str:
+    if r.error:
+        return f"Could not check: {html.escape(r.error[:300])}"
+    local, abroad = r.local(), r.abroad()
+    lines = [f"{country_name(mon_country())}: reach it: {places(local, True)}; can't: {places(local, False)}",
+             f"Abroad: reach it: {places(abroad, True)}; can't: {places(abroad, False)}"]
+    broken = [n for n in r.nodes if not n.usable]
+    if broken:
+        lines.append("Ignored (test point not working): " + ", ".join(html.escape(n.place) for n in broken))
+    return "\n".join(lines)
+
+
+def duration(sec: float) -> str:
+    m = int(sec // 60)
+    if m < 60:
+        return f"{m} min"
+    h, m = divmod(m, 60)
+    return f"{h} h {m} min" if h < 48 else f"{h // 24} days"
+
+
+VERDICT_TEXT = {
+    "ok": "reachable from {c}",
+    "partial": "partly blocked in {c}: some test points there can't reach it",
+    "blocked": "blocked in {c}: no test point there can reach it, while it works from abroad",
+    "down": "unreachable from everywhere, abroad included. That looks like a server or provider "
+            "problem, not a block",
+    "unknown": "not checked: not enough working test points",
+}
+
+
+def alert_text(old: str, new: str, held: float, r: Round) -> str:
+    c, ip = country_name(mon_country()), f"<code>{CURRENT_IP}</code>"
+    if new == "unknown":
+        return (f"Block monitor: I haven't been able to check {ip} for a while "
+                f"(check-host.net or its test points aren't answering).\n\n{round_details(r)}")
+    if new == "ok":
+        head = f"Server {ip} is reachable from {c} again"
+        if old in ("blocked", "partial", "down") and held:
+            head += f" (it was {old} for {duration(held)})"
+        return head + f".\n\n{round_details(r)}"
+    text = f"Server {ip} is {VERDICT_TEXT[new].format(c=c)}.\n\n{round_details(r)}"
+    if new in ("blocked", "partial"):
+        text += ("\n\nThis shows the IP can't be reached from inside the country. It can't show who "
+                 "blocked it. Moving to a new server gives you a new IP.")
+    return text
+
+
+BLOCK_ALERT_KB = kb([("Check again", "blockcheck")], [("New server at HostVDS", "newsrv")], [("Menu", "menu")])
+
+
+async def monitor_loop(bot: Bot) -> None:
+    await asyncio.sleep(60)  # let startup settle
+    while True:
+        try:
+            # Skip while services are moving or this server isn't the live one any more.
+            if mon_enabled() and CURRENT_IP not in ("", "unknown") and S.mode not in BUSY and not S.switched:
+                r = await run_block_check()
+                log.info("block check %s: %s %s", CURRENT_IP, r.verdict, r.error)
+                change = TRACKER.feed(CURRENT_IP, r.verdict)
+                if change:
+                    old, new, held = change
+                    markup = BLOCK_ALERT_KB if new in ("blocked", "partial") else None
+                    await bot.send_message(OWNER_ID, alert_text(old, new, held, r), reply_markup=markup)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("block monitor round failed")
+        await asyncio.sleep(mon_interval() * 60)
+
+
 # ---------- handlers ----------
 
 router = Router()
@@ -833,6 +947,51 @@ async def cb_update(cb: CallbackQuery):
         await cb.message.answer("Could not start the update: " + html.escape(out.decode(errors="replace")[:500]))
         return
     await cb.message.answer("Updating from GitHub. The bot restarts and says hello when it's done.")
+
+
+def block_kb() -> InlineKeyboardMarkup:
+    toggle = ("Turn alerts off", "blockalerts:0") if mon_enabled() else ("Turn alerts on", "blockalerts:1")
+    return kb([("Check again", "blockcheck")], [toggle], [("Menu", "menu")])
+
+
+def block_status_line() -> str:
+    if not mon_enabled():
+        return "Alerts are off."
+    return (f"Alerts are on: I check every {mon_interval()} min and message you when this changes "
+            f"(after two checks in a row agree).")
+
+
+BLOCK_CHECK_BUSY = asyncio.Lock()
+
+
+@router.callback_query(F.data == "blockcheck")
+async def cb_blockcheck(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    if BLOCK_CHECK_BUSY.locked():
+        await cb.message.answer("A check is already running.")
+        return
+    async with BLOCK_CHECK_BUSY:
+        note = await cb.message.answer(f"Asking test points in {country_name(mon_country())} and abroad to reach "
+                                       f"<code>{CURRENT_IP}</code>. This takes up to a minute...")
+        r = await run_block_check()
+        try:
+            await note.delete()
+        except TelegramAPIError:
+            pass
+    ports = ", ".join(str(p) for p in mon_ports())
+    await cb.message.answer(
+        f"Server <code>{CURRENT_IP}</code> is {VERDICT_TEXT[r.verdict].format(c=country_name(mon_country()))}.\n\n"
+        f"{round_details(r)}\n\nChecked: ping and TCP port {ports}. {block_status_line()}",
+        reply_markup=block_kb())
+
+
+@router.callback_query(F.data.startswith("blockalerts:"))
+async def cb_blockalerts(cb: CallbackQuery):
+    await cb.answer()
+    await drop_buttons(cb)
+    set_env("MONITOR_ENABLED", cb.data.split(":", 1)[1])
+    await cb.message.answer(block_status_line(), reply_markup=MENU)
 
 
 @router.callback_query(F.data == "menu")
@@ -1231,6 +1390,11 @@ async def on_startup(bot: Bot):
         await bot.send_message(OWNER_ID, text, reply_markup=MENU)
     except TelegramAPIError as e:
         log.warning("startup message failed (send /start to the bot once): %s", e)
+    global MONITOR_TASK
+    MONITOR_TASK = asyncio.create_task(monitor_loop(bot))
+
+
+MONITOR_TASK: asyncio.Task | None = None
 
 
 BOT: Bot

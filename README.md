@@ -31,6 +31,15 @@ The first tap on "New server at HostVDS" runs a one-time setup: send the login f
 New servers get the standard root password and this server's SSH key through cloud-init.
 After "Wipe old server" the bot offers to delete that server at HostVDS. It refuses to delete the live server.
 
+## Block check
+
+The admin bot watches whether the server's IP can be reached from inside Russia. Every 10 minutes it asks check-host.net test points in Russia and a few abroad (Germany, Netherlands, Finland) to ping the IP and connect to port 22. They also connect to ya.ru, so a broken test point is ignored rather than read as a block.
+If no Russian test point gets through while the ones abroad do, you get "blocked in Russia"; if at least half fail, "partly blocked"; if nobody gets through, "unreachable from everywhere" (a server or provider problem). Each alert needs two checks in a row to agree, and you get another message when the server is reachable again.
+Tap "Block check" to check right away and to turn the alerts on or off.
+
+It shows that the IP can't be reached from inside the country, not who blocked it. It also can't see blocking aimed only at the VPN protocol while the IP stays reachable.
+Optional settings in `.env`: `MONITOR_COUNTRY` (ru), `MONITOR_PORTS` (22; add the XRay port, like `"22 443"`), `MONITOR_INTERVAL` (minutes, 10), `MONITOR_REFERENCE` (ya.ru:443).
+
 ## Emailing a file
 
 For people who can't use Telegram: tap "Email settings" once and set your mailbox (Gmail, Yandex or Mail.ru, with an app password) and the recipient. After that, send the bot a file, tap Send, and it is emailed from your mailbox. The settings live in `.env` and move with the bot.
@@ -41,6 +50,7 @@ For people who can't use Telegram: tap "Email settings" once and set your mailbo
 - `migrate.sh <NEW_IP>`: 8 steps, pushes everything from this server to the new one.
 - `rollback.sh <NEW_IP>`: undoes a failed switchover.
 - `cloud.py`: small OpenStack client for HostVDS.
+- `monitor.py`: block check through check-host.net (tests: `python3 -m unittest discover tests`).
 - `wipe.sh <OLD_IP>`: wipes Macaw from an old server.
 - `install.sh`: installer/updater.
 
