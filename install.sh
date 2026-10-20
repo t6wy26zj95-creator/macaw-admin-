@@ -35,11 +35,12 @@ VERSION=unknown
 if [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then REPO_RAW="${REPO_RAW%/main}/$SHA"; VERSION=${SHA:0:7}; fi
 echo "version $VERSION"
 tmp=$(mktemp -d)
-for f in bot.py cloud.py migrate.sh rollback.sh wipe.sh; do
+for f in bot.py cloud.py monitor.py migrate.sh rollback.sh wipe.sh; do
   curl -fsSL "$REPO_RAW/$f" -o "$tmp/$f"
 done
 install -m 644 "$tmp/bot.py" "$DIR/bot.py"
 install -m 644 "$tmp/cloud.py" "$DIR/cloud.py"
+install -m 644 "$tmp/monitor.py" "$DIR/monitor.py"
 install -m 700 "$tmp/migrate.sh" "$DIR/migrate.sh"
 install -m 700 "$tmp/rollback.sh" "$DIR/rollback.sh"
 install -m 700 "$tmp/wipe.sh" "$DIR/wipe.sh"
