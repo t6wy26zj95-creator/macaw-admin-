@@ -67,11 +67,17 @@ class FakeCheckHost(CheckHost):
         super().__init__("ru")
         self.blocked, self.no_ref, self.reqs = set(blocked), set(no_ref), {}
         self.limited, self.starts = limited, 0  # first `limited` check requests get limit_exceeded
+        self.poll_limited, self.silent = 0, False  # result polls refused / test points never report
 
     async def _get(self, s, path, params=None):
         if path == "/nodes/hosts":
             return {"nodes": NODES}
         if path.startswith("/check-result/"):
+            if self.poll_limited:
+                self.poll_limited -= 1
+                return {"error": "limit_exceeded"}
+            if self.silent:
+                return {n: None for n in self.reqs[path.rsplit("/", 1)[1]][2]}
             kind, host, nodes = self.reqs[path.rsplit("/", 1)[1]]
             out = {}
             for n in nodes:
@@ -128,6 +134,22 @@ class Client(unittest.TestCase):
         fake = FakeCheckHost(limited=2)
         self.assertEqual(self.run_check(fake).verdict, "ok")
         self.assertEqual(fake.starts, 5)  # 2 refused + ping, reference, port 22
+
+    def test_rate_limited_result_polls_are_retried(self):
+        fake = FakeCheckHost()
+        fake.poll_limited = 2
+        self.assertEqual(self.run_check(fake).verdict, "ok")
+
+    def test_no_results_is_an_error_not_ignored_points(self):
+        fake = FakeCheckHost()
+        fake.silent = True
+        old, monitor.RESULT_WAIT = monitor.RESULT_WAIT, 0
+        try:
+            r = self.run_check(fake)
+        finally:
+            monitor.RESULT_WAIT = old
+        self.assertEqual(r.verdict, "unknown")
+        self.assertIn("no test point returned", r.error)
 
     def test_gives_up_when_still_rate_limited(self):
         r = self.run_check(FakeCheckHost(limited=99))

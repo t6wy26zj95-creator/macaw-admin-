@@ -28,7 +28,9 @@ HEADERS = {"Accept": "application/json", "User-Agent": "macaw-admin-monitor"}
 CONTROL_COUNTRIES = ("de", "nl", "fi", "fr", "pl", "se", "gb", "ch", "at", "cz")
 MAX_LOCAL = 6
 MAX_CONTROL = 3
-RESULT_WAIT = 60  # seconds to wait for test points to report
+RESULT_WAIT = 90  # seconds to wait for test points to report
+RESULT_FIRST_POLL = 8  # most test points report within a few seconds
+RESULT_POLL = 10
 REQUEST_GAP = 3  # seconds between check requests
 LIMIT_RETRY_WAITS = (20, 40)  # seconds to wait before retrying after "limit_exceeded"
 COUNTRY_NAMES = {"ru": "Russia", "by": "Belarus", "ir": "Iran", "cn": "China", "tr": "Turkey",
@@ -188,11 +190,24 @@ class CheckHost:
                 self._nodes[name] = (str(info[0]).lower(), str(info[2]) if len(info) > 2 else "")
         deadline = time.time() + RESULT_WAIT
         res: dict = {}
-        while time.time() < deadline:
-            await asyncio.sleep(5)
-            res = await self._get(s, f"/check-result/{rid}") or {}
-            if all(res.get(n) is not None for n in nodes):
+        await asyncio.sleep(RESULT_FIRST_POLL)
+        while True:
+            got = await self._get(s, f"/check-result/{rid}") or {}
+            # Polling is rate limited too: then the answer is {"error": ...}, not results.
+            # Earlier this was read as "no test point answered" and every point got ignored.
+            if isinstance(got.get("error"), str):
+                if got["error"] != "limit_exceeded":
+                    raise CheckError(f"check-host.net: {got['error'][:100]}")
+                if time.time() + LIMIT_RETRY_WAITS[0] > deadline:
+                    raise CheckError("check-host.net is rate limiting this server")
+                await asyncio.sleep(LIMIT_RETRY_WAITS[0])
+                continue
+            res = got
+            if all(res.get(n) is not None for n in nodes) or time.time() + RESULT_POLL > deadline:
                 break
+            await asyncio.sleep(RESULT_POLL)
+        if all(res.get(n) is None for n in nodes):
+            raise CheckError(f"no test point returned the {kind} result within {RESULT_WAIT} s")
         return res
 
     async def run(self, ip: str, ports: list[int], reference: str, max_age: float = 0) -> Round:

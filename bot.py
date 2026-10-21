@@ -691,6 +691,8 @@ def round_details(r: Round) -> str:
     if r.error:
         return f"Could not check: {html.escape(r.error[:300])}"
     local, abroad = r.local(), r.abroad()
+    if not local and not abroad:
+        return "No test point gave a usable answer."
     lines = [f"{country_name(mon_country())}: reach it: {places(local, True)}; can't: {places(local, False)}",
              f"Abroad: reach it: {places(abroad, True)}; can't: {places(abroad, False)}"]
     broken = [n for n in r.nodes if not n.usable]
@@ -754,7 +756,8 @@ async def monitor_loop(bot: Bot) -> None:
             raise
         except Exception:
             log.exception("block monitor round failed")
-        await asyncio.sleep(mon_interval() * 60)
+        # Back off while checks fail (usually check-host.net's rate limit): 10, 20, 30, 30... min.
+        await asyncio.sleep(mon_interval() * 60 * min(TRACKER.unknown_streak + 1, 3))
 
 
 # ---------- handlers ----------
