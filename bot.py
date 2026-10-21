@@ -99,7 +99,7 @@ def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 
 MENU = kb([("New server at HostVDS", "newsrv")], [("Migrate to a new server", "migrate")],
           [("Wipe old server", "wipe")], [("Block check", "blockcheck")], [("Email settings", "email")],
-          [("Update admin bot", "update")])
+          [("Update SRS bot", "srsupdate")], [("Update admin bot", "update")])
 CANCEL = kb([("Cancel", "cancel")])
 CONFIRM = kb([("Start", "start"), ("Cancel", "cancel")])
 
@@ -956,6 +956,94 @@ async def cb_update(cb: CallbackQuery):
     await cb.message.answer("Updating from GitHub. The bot restarts and says hello when it's done.")
 
 
+# ---------- SRS bot update ----------
+# Runs the SRS bot's own updater (/opt/macaw/app/deploy/update.sh) and reports its output.
+# It runs in its own unit, so it survives an admin bot restart; the exit code goes to a
+# file, and a result the bot didn't get to report is sent on the next start.
+
+SRS_UPDATE_SCRIPT = "/opt/macaw/app/deploy/update.sh"
+SRS_UPDATE_UNIT = "macaw-srs-update"
+SRS_UPDATE_LOG = LOG_DIR / "srs-update.log"
+SRS_UPDATE_RC = LOG_DIR / "srs-update.rc"           # exit code, written when the script ends
+SRS_UPDATE_PENDING = LOG_DIR / "srs-update.pending"  # exists until the result is reported
+SRS_UPDATE_TIMEOUT = 30 * 60
+
+
+async def srs_update_active() -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", "is-active", "--quiet", SRS_UPDATE_UNIT,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    return await proc.wait() == 0
+
+
+async def report_srs_update(bot: Bot) -> None:
+    """Send the update result (tail in the message, full log attached) once."""
+    if not SRS_UPDATE_PENDING.exists():
+        return
+    SRS_UPDATE_PENDING.unlink(missing_ok=True)
+    try:
+        rc = SRS_UPDATE_RC.read_text().strip()
+    except FileNotFoundError:
+        rc = ""
+    try:
+        lines = SRS_UPDATE_LOG.read_text(errors="replace").splitlines()
+    except FileNotFoundError:
+        lines = []
+    if rc == "0":
+        head = "SRS bot updated."
+    elif rc:
+        head = f"SRS bot update failed (exit code {html.escape(rc)})."
+    else:
+        head = "SRS bot update stopped without finishing (killed or timed out)."
+    tail = "\n".join(lines[-25:])[-3000:]
+    text = head + (f"\n\n<pre>{html.escape(tail)}</pre>" if tail else "\n\nThe script printed nothing.")
+    try:
+        await bot.send_message(OWNER_ID, text, reply_markup=MENU)
+        if len(lines) > 25:
+            await bot.send_document(OWNER_ID, FSInputFile(SRS_UPDATE_LOG), caption="Full log")
+    except TelegramAPIError as e:
+        log.warning("sending SRS update result failed: %s", e)
+
+
+async def watch_srs_update(bot: Bot) -> None:
+    deadline = time.monotonic() + SRS_UPDATE_TIMEOUT + 60
+    await asyncio.sleep(2)
+    while time.monotonic() < deadline and not SRS_UPDATE_RC.exists() and await srs_update_active():
+        await asyncio.sleep(3)
+    await report_srs_update(bot)
+
+
+@router.callback_query(F.data == "srsupdate")
+async def cb_srsupdate(cb: CallbackQuery):
+    await cb.answer()
+    if S.mode in BUSY or S.switched:
+        await cb.message.answer("Not now: a migration, rollback or wipe is running or unfinished.")
+        return
+    if not Path(SRS_UPDATE_SCRIPT).is_file():
+        await cb.message.answer(f"<code>{SRS_UPDATE_SCRIPT}</code> is not on this server.")
+        return
+    if await srs_update_active():
+        await cb.message.answer("An SRS bot update is already running. I'll send the result when it ends.")
+        return
+    LOG_DIR.mkdir(exist_ok=True)
+    SRS_UPDATE_RC.unlink(missing_ok=True)
+    SRS_UPDATE_LOG.write_text("")
+    SRS_UPDATE_PENDING.touch()
+    proc = await asyncio.create_subprocess_exec(
+        "systemd-run", "--quiet", "--collect", f"--unit={SRS_UPDATE_UNIT}",
+        f"--property=RuntimeMaxSec={SRS_UPDATE_TIMEOUT}", "--setenv=HOME=/root",
+        "--setenv=DEBIAN_FRONTEND=noninteractive", "/bin/bash", "-c",
+        f'sudo bash {SRS_UPDATE_SCRIPT} </dev/null > {SRS_UPDATE_LOG} 2>&1; echo $? > {SRS_UPDATE_RC}',
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        SRS_UPDATE_PENDING.unlink(missing_ok=True)
+        await cb.message.answer("Could not start the update: " + html.escape(out.decode(errors="replace")[:500]))
+        return
+    await cb.message.answer("Updating the SRS bot. I'll send the output when it's done.")
+    asyncio.create_task(watch_srs_update(BOT))
+
+
 def block_kb() -> InlineKeyboardMarkup:
     toggle = ("Turn alerts off", "blockalerts:0") if mon_enabled() else ("Turn alerts on", "blockalerts:1")
     return kb([("Check again", "blockcheck")], [toggle], [("Menu", "menu")])
@@ -1399,6 +1487,8 @@ async def on_startup(bot: Bot):
         log.warning("startup message failed (send /start to the bot once): %s", e)
     global MONITOR_TASK
     MONITOR_TASK = asyncio.create_task(monitor_loop(bot))
+    if SRS_UPDATE_PENDING.exists():  # an SRS update was running when the bot restarted
+        asyncio.create_task(watch_srs_update(bot))
 
 
 MONITOR_TASK: asyncio.Task | None = None

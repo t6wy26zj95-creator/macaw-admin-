@@ -40,6 +40,10 @@ Tap "Block check" to check right away and to turn the alerts on or off.
 It shows that the IP can't be reached from inside the country, not who blocked it. It also can't see blocking aimed only at the VPN protocol while the IP stays reachable.
 Optional settings in `.env`: `MONITOR_COUNTRY` (ru), `MONITOR_PORTS` (22; add the XRay port, like `"22 443"`), `MONITOR_INTERVAL` (minutes, 10), `MONITOR_REFERENCE` (ya.ru:443).
 
+## Updating the SRS bot
+
+Tap "Update SRS bot" to run `sudo bash /opt/macaw/app/deploy/update.sh`. When it ends the bot sends the last lines of its output (and the full log if it is long), or the exit code if it failed. It runs in its own systemd unit with a 30 minute limit, so the result still arrives if the admin bot restarts meanwhile. Log: `/opt/macaw-admin/logs/srs-update.log`.
+
 ## Emailing a file
 
 For people who can't use Telegram: tap "Email settings" once and set your mailbox (Gmail, Yandex or Mail.ru, with an app password) and the recipient. After that, send the bot a file, tap Send, and it is emailed from your mailbox. The settings live in `.env` and move with the bot.
