@@ -33,12 +33,12 @@ After "Wipe old server" the bot offers to delete that server at HostVDS. It refu
 
 ## Block check
 
-The admin bot watches whether the server's IP can be reached from inside Russia. Every 10 minutes it asks check-host.net test points in Russia and a few abroad (Germany, Netherlands, Finland) to ping the IP and connect to port 22. They also connect to ya.ru, so a broken test point is ignored rather than read as a block.
+The admin bot watches whether the server's IP can be reached from inside Russia. Every 10 minutes it asks test points in Russia (home and office connections on different ISPs, from Globalping) and a few abroad (Germany, Netherlands, Finland) to connect to port 22. The same test points also connect to ya.ru, so a broken test point is ignored rather than read as a block. If Globalping can't run a check, check-host.net is used instead.
 If no Russian test point gets through while the ones abroad do, you get "blocked in Russia"; if at least half fail, "partly blocked"; if nobody gets through, "unreachable from everywhere" (a server or provider problem). Each alert needs two checks in a row to agree, and you get another message when the server is reachable again.
 Tap "Block check" to check right away and to turn the alerts on or off.
 
 It shows that the IP can't be reached from inside the country, not who blocked it. It also can't see blocking aimed only at the VPN protocol while the IP stays reachable.
-Optional settings in `.env`: `MONITOR_COUNTRY` (ru), `MONITOR_PORTS` (22; add the XRay port, like `"22 443"`), `MONITOR_INTERVAL` (minutes, 10), `MONITOR_REFERENCE` (ya.ru:443).
+Optional settings in `.env`: `MONITOR_COUNTRY` (ru), `MONITOR_PORTS` (22; add the XRay port, like `"22 443"`), `MONITOR_INTERVAL` (minutes, 10), `MONITOR_REFERENCE` (ya.ru:443), `GLOBALPING_TOKEN` (free token from dash.globalping.io for a higher hourly limit; not needed).
 
 ## Updating the SRS bot
 
@@ -54,7 +54,7 @@ For people who can't use Telegram: tap "Email settings" once and set your mailbo
 - `migrate.sh <NEW_IP>`: 8 steps, pushes everything from this server to the new one.
 - `rollback.sh <NEW_IP>`: undoes a failed switchover.
 - `cloud.py`: small OpenStack client for HostVDS.
-- `monitor.py`: block check through check-host.net (tests: `python3 -m unittest discover tests`).
+- `monitor.py`: block check through Globalping and check-host.net (tests: `python3 -m unittest discover tests`).
 - `wipe.sh <OLD_IP>`: wipes Macaw from an old server.
 - `install.sh`: installer/updater.
 

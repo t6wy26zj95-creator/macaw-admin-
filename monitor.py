@@ -1,8 +1,10 @@
 """Block monitor: checks from test points inside a country (Russia by default) whether this
-server's IP can still be reached, using the free check-host.net API.
+server's IP can still be reached. Test points come from Globalping (api.globalping.io, community
+probes on home and office connections, 250 tests an hour for free), with check-host.net as a
+fallback when Globalping can't run a round.
 
-Each round asks the in-country test points and a few test points abroad to ping the IP and open
-a TCP connection to it (port 22 by default). The same points also connect to a reference site
+Each round asks the in-country test points and a few test points abroad to open a TCP
+connection to the IP (port 22 by default; check-host.net also pings it). The same points also connect to a reference site
 that is known to work in that country, so a broken test point is ignored instead of read as a block.
 
 Verdicts:
@@ -10,7 +12,7 @@ Verdicts:
   partial  at least half of them can't, the rest can
   blocked  none of them can, while test points abroad can
   down     nobody can, abroad included (server or provider problem, not a block)
-  unknown  not enough working test points or check-host.net didn't answer
+  unknown  not enough working test points, or neither service could run the check
 
 This tells whether the IP is reachable from inside the country. It can't tell who blocked it,
 and it can't see blocking aimed only at the VPN protocol while the IP stays reachable.
@@ -71,6 +73,7 @@ class Round:
     verdict: str
     nodes: list[NodeResult] = field(default_factory=list)
     error: str = ""
+    source: str = ""
 
     def local(self) -> list[NodeResult]:
         return [n for n in self.nodes if n.local and n.usable]
@@ -245,7 +248,140 @@ class CheckHost:
                 target_ok=combine(ping_ok(ping.get(n)), *(tcp_ok(t.get(n)) for t in tcps)),
                 ref_ok=tcp_ok(ref.get(n)),
             ))
-        return Round(decide(results), results)
+        return Round(decide(results), results, source="check-host.net")
+
+
+# ---------- Globalping ----------
+
+GP_API = "https://api.globalping.io/v1"
+GP_LOCAL_PROBES = 4
+GP_CONTROL = ("DE", "NL", "FI")
+GP_WAIT = 60
+
+
+def gp_ok(result: dict) -> bool | None:
+    """One probe's TCP ping result. None if the probe didn't run it (offline, still running)."""
+    res = (result or {}).get("result") or {}
+    status = res.get("status")
+    if status == "finished":
+        stats = res.get("stats") or {}
+        if stats.get("rcv") is not None:
+            return stats["rcv"] > 0
+        if stats.get("loss") is not None:
+            return stats["loss"] < 100
+        return bool(res.get("timings"))
+    if status == "failed":
+        return False
+    return None
+
+
+def gp_key(result: dict) -> tuple:
+    p = (result or {}).get("probe") or {}
+    return (p.get("country"), p.get("city"), p.get("asn"), p.get("network"))
+
+
+def split_host_port(target: str) -> tuple[str, int]:
+    host, _, port = target.rpartition(":")
+    return (host, int(port)) if host and port.isdigit() else (target, 443)
+
+
+class Globalping:
+    def __init__(self, country: str, token: str = ""):
+        self.country, self.token = country.lower(), token
+
+    async def _req(self, s: aiohttp.ClientSession, method: str, path: str, body=None) -> tuple[int, dict]:
+        headers = {"User-Agent": "macaw-admin-monitor", "Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        async with s.request(method, GP_API + path, json=body, headers=headers) as r:
+            try:
+                data = await r.json(content_type=None)
+            except ValueError:
+                data = {}
+            return r.status, data if isinstance(data, dict) else {}
+
+    async def _measure(self, s, target: str, port: int, locations) -> tuple[str, list[dict]]:
+        body = {"type": "ping", "target": target, "locations": locations,
+                "measurementOptions": {"packets": 3, "protocol": "TCP", "port": port}}
+        status, data = await self._req(s, "POST", "/measurements", body)
+        if status == 429:
+            raise CheckError("Globalping's hourly limit is used up")
+        if status not in (200, 201, 202) or not data.get("id"):
+            err = data.get("error") or {}
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise CheckError(f"Globalping answered HTTP {status}: {(msg or '')[:150]}")
+        mid = data["id"]
+        deadline = time.time() + GP_WAIT
+        m: dict = {}
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            status, m = await self._req(s, "GET", f"/measurements/{mid}")
+            if status == 200 and m.get("status") != "in-progress":
+                break
+        return mid, m.get("results") or []
+
+    async def _group(self, s, ip: str, ports: list[int], ref: tuple[str, int], locations,
+                     local: bool) -> list[NodeResult]:
+        mid, first = await self._measure(s, ip, ports[0], locations)
+        others = [(await self._measure(s, ip, p, mid))[1] for p in ports[1:]]  # same probes
+        _, refs = await self._measure(s, ref[0], ref[1], mid)
+        by_key: dict[tuple, list] = {}
+        for r in refs:
+            by_key.setdefault(gp_key(r), []).append(gp_ok(r))
+        out = []
+        for i, r in enumerate(first):
+            key = gp_key(r)
+            port_oks = [gp_ok(r)] + [gp_ok(o[i]) if i < len(o) and gp_key(o[i]) == key else None
+                                     for o in others]
+            ref_ok = by_key[key].pop(0) if by_key.get(key) else None
+            p = r.get("probe") or {}
+            city, net = p.get("city") or "", (p.get("network") or "")[:25]
+            out.append(NodeResult(node=f"gp-{local}-{i}", country=str(p.get("country", "")).lower(),
+                                  city=f"{city} ({net})" if net else city, local=local,
+                                  target_ok=combine(*port_oks), ref_ok=ref_ok))
+        return out
+
+    async def run(self, ip: str, ports: list[int], reference: str) -> Round:
+        ref = split_host_port(reference)
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+                local = await self._group(s, ip, ports, ref,
+                                          [{"country": self.country.upper(), "limit": GP_LOCAL_PROBES}], True)
+                abroad = await self._group(s, ip, ports, ref,
+                                           [{"country": c, "limit": 1} for c in GP_CONTROL
+                                            if c.lower() != self.country], False)
+        except Exception as e:
+            return Round("unknown", error=str(e) or type(e).__name__, source="Globalping")
+        nodes = local + abroad
+        return Round(decide(nodes), nodes, source="Globalping")
+
+
+class Prober:
+    """Globalping first, check-host.net if Globalping can't give an answer. One round at a time,
+    and a round from the last max_age seconds is reused."""
+
+    def __init__(self, country: str, token: str = ""):
+        self.gp, self.ch = Globalping(country, token), CheckHost(country)
+        self._lock = asyncio.Lock()
+        self._last: Round | None = None
+        self._last_at = 0.0
+
+    async def run(self, ip: str, ports: list[int], reference: str, max_age: float = 0) -> Round:
+        async with self._lock:
+            if self._last and time.time() - self._last_at < max_age:
+                return self._last
+            r = await self.gp.run(ip, ports, reference)
+            if r.verdict == "unknown":
+                r2 = await self.ch._run(ip, ports, reference)
+                if r2.verdict != "unknown":
+                    r = r2
+                else:
+                    why_gp = r.error or "not enough working test points"
+                    why_ch = r2.error or "not enough working test points"
+                    r = Round("unknown", r.nodes + r2.nodes,
+                              error=f"Globalping: {why_gp}. check-host.net: {why_ch}.")
+            self._last, self._last_at = r, time.time()
+            return r
 
 
 def country_name(cc: str) -> str:

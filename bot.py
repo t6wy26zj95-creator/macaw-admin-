@@ -25,7 +25,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 
 from cloud import OPENRC_KEYS, Cloud, CloudError, cloud_config, find_auth_url, parse_openrc
-from monitor import DEFAULT_REFERENCE, CheckHost, Round, Tracker, country_name
+from monitor import DEFAULT_REFERENCE, Prober, Round, Tracker, country_name
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -647,7 +647,8 @@ def email_ready() -> bool:
 # Test points inside the country (check-host.net) try to reach this server every few minutes.
 # Settings in .env (all optional): MONITOR_ENABLED (1/0), MONITOR_COUNTRY (ru),
 # MONITOR_PORTS (22; add the XRay port, e.g. "22 443"), MONITOR_INTERVAL (minutes, 10),
-# MONITOR_REFERENCE (a site that works in that country, ya.ru:443 for Russia).
+# MONITOR_REFERENCE (a site that works in that country, ya.ru:443 for Russia),
+# GLOBALPING_TOKEN (free token from dash.globalping.io for a higher hourly limit; not needed).
 
 def mon_country() -> str:
     return (CFG.get("MONITOR_COUNTRY") or "ru").strip().lower()
@@ -673,7 +674,7 @@ def mon_enabled() -> bool:
     return CFG.get("MONITOR_ENABLED", "1") != "0"
 
 
-CHECKER = CheckHost(mon_country())
+CHECKER = Prober(mon_country(), CFG.get("GLOBALPING_TOKEN", ""))
 TRACKER = Tracker(BASE / "monitor-state.json")
 
 
@@ -698,6 +699,8 @@ def round_details(r: Round) -> str:
     broken = [n for n in r.nodes if not n.usable]
     if broken:
         lines.append("Ignored (test point not working): " + ", ".join(html.escape(n.place) for n in broken))
+    if r.source:
+        lines.append(f"Test points from {r.source}.")
     return "\n".join(lines)
 
 
@@ -715,7 +718,7 @@ VERDICT_TEXT = {
     "blocked": "blocked in {c}: no test point there can reach it, while it works from abroad",
     "down": "unreachable from everywhere, abroad included. That looks like a server or provider "
             "problem, not a block",
-    "unknown": "not checked: not enough working test points",
+    "unknown": "not checked right now",
 }
 
 
@@ -1080,7 +1083,7 @@ async def cb_blockcheck(cb: CallbackQuery):
     ports = ", ".join(str(p) for p in mon_ports())
     await cb.message.answer(
         f"Server <code>{CURRENT_IP}</code> is {VERDICT_TEXT[r.verdict].format(c=country_name(mon_country()))}.\n\n"
-        f"{round_details(r)}\n\nChecked: ping and TCP port {ports}. {block_status_line()}",
+        f"{round_details(r)}\n\nChecked: connecting to port {ports}. {block_status_line()}",
         reply_markup=block_kb())
 
 

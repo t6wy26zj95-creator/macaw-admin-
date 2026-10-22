@@ -209,5 +209,96 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(out, [None, None, ("", "unknown", 0), None, None])
 
 
+# ---------- Globalping ----------
+
+GP_PROBES = {
+    "RU": [("RU", "Moscow", 12389, "Rostelecom"), ("RU", "Moscow", 8359, "MTS"),
+           ("RU", "Saint Petersburg", 31213, "MegaFon")],
+    "DE": [("DE", "Frankfurt", 24940, "Hetzner")], "NL": [("NL", "Amsterdam", 1136, "KPN")],
+    "FI": [("FI", "Helsinki", 1759, "Telia")],
+}
+
+
+class FakeGlobalping(monitor.Globalping):
+    def __init__(self, blocked=(), no_ref=(), no_ru=False, status=202):
+        super().__init__("ru")
+        self.blocked, self.no_ref, self.no_ru, self.status = set(blocked), set(no_ref), no_ru, status
+        self.ms, self.posts = {}, 0
+
+    async def _req(self, s, method, path, body=None):
+        if method == "POST":
+            self.posts += 1
+            if self.status != 202:
+                return self.status, {"error": {"message": "Too many requests"}}
+            loc = body["locations"]
+            if isinstance(loc, str):
+                probes = self.ms[loc][0]
+            else:
+                probes = [p for l in loc for p in GP_PROBES.get(l["country"], [])[:l["limit"]]]
+                if self.no_ru and any(l["country"] == "RU" for l in loc):
+                    return 422, {"error": {"message": "No suitable probes found."}}
+            mid = f"m{len(self.ms)}"
+            self.ms[mid] = (probes, body["target"])
+            return 202, {"id": mid, "probesCount": len(probes)}
+        probes, target = self.ms[path.rsplit("/", 1)[1]]
+        results = []
+        for p in probes:
+            bad = p[1] + "/" + p[3] in (self.no_ref if target == "ya.ru" else self.blocked)
+            results.append({"probe": dict(zip(("country", "city", "asn", "network"), p)),
+                            "result": {"status": "finished",
+                                       "stats": {"total": 3, "rcv": 0 if bad else 3, "loss": 100 if bad else 0}}})
+        return 200, {"id": "x", "status": "finished", "results": results}
+
+
+class GlobalpingTest(unittest.TestCase):
+    def setUp(self):
+        self._sleep = monitor.asyncio.sleep
+
+        async def no_sleep(_):
+            return None
+        monitor.asyncio.sleep = no_sleep
+
+    def tearDown(self):
+        monitor.asyncio.sleep = self._sleep
+
+    def test_ok(self):
+        gp = FakeGlobalping()
+        r = asyncio.run(gp.run(IP, [22], "ya.ru:443"))
+        self.assertEqual(r.verdict, "ok")
+        self.assertEqual([n.place for n in r.local()],
+                         ["Moscow (Rostelecom)", "Moscow (MTS)", "Saint Petersburg (MegaFon)"])
+        self.assertEqual(len(r.abroad()), 3)
+        self.assertEqual(gp.posts, 4)  # target + reference, for Russia and for abroad
+
+    def test_blocked_and_broken_probe(self):
+        gp = FakeGlobalping(blocked={"Moscow/Rostelecom", "Moscow/MTS", "Saint Petersburg/MegaFon"},
+                            no_ref={"Moscow/MTS"})
+        r = asyncio.run(gp.run(IP, [22], "ya.ru:443"))
+        self.assertEqual(r.verdict, "blocked")
+        self.assertEqual(len(r.local()), 2)
+
+    def test_extra_port_counts(self):
+        gp = FakeGlobalping()
+        r = asyncio.run(gp.run(IP, [22, 443], "ya.ru:443"))
+        self.assertEqual(r.verdict, "ok")
+        self.assertEqual(gp.posts, 6)
+
+    def test_falls_back_to_check_host(self):
+        p = monitor.Prober("ru")
+        p.gp = FakeGlobalping(no_ru=True)
+        p.ch = FakeCheckHost()
+        r = asyncio.run(p.run(IP, [22], "ya.ru:443"))
+        self.assertEqual((r.verdict, r.source), ("ok", "check-host.net"))
+
+    def test_both_fail_explains_both(self):
+        p = monitor.Prober("ru")
+        p.gp = FakeGlobalping(status=429)
+        p.ch = FakeCheckHost(limited=99)
+        r = asyncio.run(p.run(IP, [22], "ya.ru:443"))
+        self.assertEqual(r.verdict, "unknown")
+        self.assertIn("hourly limit", r.error)
+        self.assertIn("rate limiting", r.error)
+
+
 if __name__ == "__main__":
     unittest.main()
