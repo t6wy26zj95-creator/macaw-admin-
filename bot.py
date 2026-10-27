@@ -537,8 +537,15 @@ async def create_server(bot: Bot) -> None:
     progress = Progress(bot, "New server at HostVDS")
     await progress.show()
     c = Cloud(CFG)
+    ip = None
     try:
         await progress.step("1/3 Ordering the server")
+        if Cloud.is_prebuilt({"name": CFG.get("HOSTVDS_IMAGE_LABEL", "")}):
+            # Setup used to pick a prebuilt image (Ubuntu with awg-easy) by mistake: switch to plain Ubuntu.
+            image = Cloud.pick_ubuntu_2404(await c.images())
+            if image and not Cloud.is_prebuilt(image):
+                set_env("HOSTVDS_IMAGE", image["id"])
+                set_env("HOSTVDS_IMAGE_LABEL", image.get("name", image["id"]))
         flavors = {f["id"]: f for f in await c.flavors()}
         flavor = flavors.get(CFG["HOSTVDS_FLAVOR"])
         if not flavor:
@@ -558,7 +565,9 @@ async def create_server(bot: Bot) -> None:
         progress.finish_running("failed")
         await progress.show()
         S.mode = "idle"
-        await bot.send_message(OWNER_ID, f"Creating the server failed: {html.escape(str(e))[:700]}", reply_markup=MENU)
+        markup = kb([(f"Delete {ip} at HostVDS", f"srvdel:{ip}")], [("Menu", "menu")]) if ip else MENU
+        await bot.send_message(OWNER_ID, f"Creating the server failed: {html.escape(str(e))[:700]}",
+                               reply_markup=markup)
         return
     progress.finish_running("done")
     await progress.show()
@@ -785,6 +794,21 @@ async def drop_buttons(cb: CallbackQuery) -> None:
         await cb.message.edit_reply_markup(reply_markup=None)
     except TelegramAPIError:
         pass
+
+
+@router.message(Command("delete"))
+async def cmd_delete(message: Message):
+    """/delete <ip>: delete a HostVDS server (asks first; never the live one)."""
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", parts[1]) or not cloud_creds_ready():
+        await message.answer("Send it like this: <code>/delete 1.2.3.4</code>", reply_markup=MENU)
+        return
+    if S.mode in BUSY:
+        return
+    S.del_ip, S.mode = parts[1], "srvdel_confirm"
+    await message.answer(f"Delete server <code>{S.del_ip}</code> at HostVDS? It is destroyed for good "
+                         "and billing for it stops.",
+                         reply_markup=kb([("Delete", "srvdel_go"), ("Cancel", "cancel")]))
 
 
 @router.message(Command("openports"))

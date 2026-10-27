@@ -325,8 +325,14 @@ class Cloud:
     def pick_ubuntu_2404(images: list[dict]) -> dict | None:
         cands = [i for i in images if re.search(r"ubuntu", i.get("name", ""), re.I)
                  and re.search(r"24\.04|noble", i.get("name", ""), re.I)]
-        cands.sort(key=lambda i: i.get("created_at", ""), reverse=True)
+        # HostVDS also has "prebuilt_<app>_Ubuntu-24.04" images with software already installed
+        # (e.g. awg-easy). We want the plain system, so those only count if nothing else exists.
+        cands.sort(key=lambda i: (not Cloud.is_prebuilt(i), i.get("created_at", "")), reverse=True)
         return cands[0] if cands else None
+
+    @staticmethod
+    def is_prebuilt(image: dict) -> bool:
+        return bool(re.search(r"prebuilt|awg|easy|docker|panel|marzban|outline|3x-ui", image.get("name", ""), re.I))
 
     # ---- servers ----
 
