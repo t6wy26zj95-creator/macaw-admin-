@@ -554,6 +554,8 @@ async def create_server(bot: Bot) -> None:
             images = [{"id": CFG["HOSTVDS_IMAGE"], "name": CFG.get("HOSTVDS_IMAGE_LABEL", "")}]
         elif saved and not Cloud.is_prebuilt(saved[0]):
             images = saved + [i for i in images if i is not saved[0]]
+        # Every image failing means HostVDS has no room for this plan here, so stop after two.
+        images = images[:2]
         srv = None
         for n, image in enumerate(images):
             if n:
@@ -574,7 +576,9 @@ async def create_server(bot: Bot) -> None:
                 except Exception:
                     log.exception("could not delete failed server")
                 if n == len(images) - 1:
-                    raise
+                    raise CloudError("HostVDS can't place this plan right now (\"No valid host was found\"). "
+                                     "That usually means the plan is out of stock in this location, or the "
+                                     "account hit a server limit. The failed servers were deleted.")
         if image["id"] != CFG["HOSTVDS_IMAGE"]:
             set_env("HOSTVDS_IMAGE", image["id"])
             set_env("HOSTVDS_IMAGE_LABEL", image.get("name", image["id"]))
