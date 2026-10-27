@@ -24,7 +24,7 @@ from pathlib import Path
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 
-from cloud import OPENRC_KEYS, Cloud, CloudError, cloud_config, find_auth_url, parse_openrc
+from cloud import OPENRC_KEYS, Cloud, CloudError, cloud_config, find_auth_url, looks_like_example, parse_openrc
 from monitor import DEFAULT_REFERENCE, Prober, Round, Tracker, country_name
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -571,23 +571,33 @@ async def create_server(bot: Bot) -> None:
         reply_markup=kb([(f"Migrate to {ip}", f"migrate_to:{ip}")], [("Menu", "menu")]))
 
 
-async def accept_cloud_settings(message: Message, values: dict) -> None:
+async def accept_cloud_settings(message: Message, values: dict, text: str = "") -> None:
     if not values.get("OS_USERNAME"):
-        await message.answer("I couldn't find the login in that. It starts with hostvds- and is at the top "
-                             "of the HostVDS API page. Copy it and send it here.", reply_markup=CANCEL)
+        if looks_like_example(text):
+            hint = ("That's the example commands from the bottom of the HostVDS API page. "
+                    "They don't contain your login.\n\n")
+        else:
+            hint = "I couldn't find the login in that.\n\n"
+        await message.answer(
+            hint + "On the HostVDS API page, copy the text in the Login box (just above Password). "
+            "It starts with <code>hostvds-</code>. Send just that here. You don't need the openrc.sh file.",
+            reply_markup=CANCEL)
         return
     S.cloud_tmp, S.mode = values, "cloud_ask_pass"
-    await message.answer("Got it. Now send the API password (tap Show on the HostVDS API page and copy it). "
-                         "I will delete your message right away.", reply_markup=CANCEL)
+    await message.answer(f"Got it, login <code>{html.escape(values['OS_USERNAME'])}</code>.\n\n"
+                         "Now send the API password: on the same HostVDS API page, tap Show next to the "
+                         "password and copy it. I will delete your message right away.", reply_markup=CANCEL)
 
 
 async def show_cloud_setup_start(message: Message) -> None:
     S.mode, S.cloud_tmp, S.cloud_lists = "cloud_ask_openrc", {}, {}
     await message.answer(
         "HostVDS setup (one time).\n\n"
-        "Open the HostVDS API page, copy your login (it starts with hostvds-) and send it here. "
-        "Then I will ask for the password.\n\n"
-        "You can also send the openrc.sh file instead, if you have it.",
+        "1. Open the HostVDS API page.\n"
+        "2. Copy the text in the Login box (just above Password). It starts with <code>hostvds-</code>. "
+        "Send just that here, not the OpenStack example commands below it.\n"
+        "3. Then I will ask for the password from the same page.\n\n"
+        "You don't need the openrc.sh file.",
         reply_markup=CANCEL)
 
 
@@ -1304,7 +1314,7 @@ async def cb_rollback(cb: CallbackQuery):
 @router.message()
 async def on_message(message: Message):
     if S.mode == "cloud_ask_openrc":
-        await accept_cloud_settings(message, parse_openrc(message.text or ""))
+        await accept_cloud_settings(message, parse_openrc(message.text or ""), message.text or "")
         return
 
     if S.mode == "cloud_ask_pass":

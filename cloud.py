@@ -43,12 +43,32 @@ def parse_openrc(text: str) -> dict[str, str]:
     if "OS_AUTH_URL" not in out or "OS_USERNAME" not in out:
         # Not an openrc: accept loose text, e.g. the Identity URL from Horizon's API Access page plus the login.
         url = re.search(r"https?://[^\s'\"]+", text)
-        login = re.search(r"\b(hostvds-[0-9a-fA-F-]{8,})\b", text)
+        login = find_login(text)
         if url and "OS_AUTH_URL" not in out:
             out["OS_AUTH_URL"] = url.group(0)
         if login and "OS_USERNAME" not in out:
-            out["OS_USERNAME"] = login.group(1)
+            out["OS_USERNAME"] = login
     return out
+
+
+def find_login(text: str) -> str | None:
+    """Find the HostVDS login in pasted text: "hostvds-..." anywhere, a "Login: ..." / "Username: ..."
+    line, or a message that is just one word (the login copied on its own)."""
+    m = re.search(r"(?<![\w-])(hostvds-[A-Za-z0-9][A-Za-z0-9._@-]*[A-Za-z0-9])", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?im)^\s*(?:login|user\s*name|username|user|логин|имя пользователя)\s*[:=]\s*[\"']?([^\s\"']+)", text)
+    if m:
+        return m.group(1)
+    word = text.strip().strip("\"'`")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{2,63}", word) and not word.lower().startswith(("http", "openstack")):
+        return word
+    return None
+
+
+def looks_like_example(text: str) -> bool:
+    """True for the example commands from the API page (openstack server create, pip install ...)."""
+    return bool(re.search(r"openstack\s+(server|flavor|image|network)\b|pip install|python-openstackclient", text))
 
 
 HORIZON_BASES = ("https://horizon.hostvds.com", "https://horizon.hostvds.com/dashboard")
