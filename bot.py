@@ -29,7 +29,7 @@ from monitor import DEFAULT_REFERENCE, Prober, Round, Tracker, country_name
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
@@ -785,6 +785,31 @@ async def drop_buttons(cb: CallbackQuery) -> None:
         await cb.message.edit_reply_markup(reply_markup=None)
     except TelegramAPIError:
         pass
+
+
+@router.message(Command("openports"))
+async def cmd_openports(message: Message):
+    """Servers created before the firewall fix: let SSH and the VPN in."""
+    if not cloud_creds_ready():
+        await message.answer("HostVDS isn't set up yet.", reply_markup=MENU)
+        return
+    try:
+        c = Cloud(CFG)
+        servers = (await c.call("GET", "compute", "/servers/detail")).get("servers", [])
+        done = []
+        for srv in servers:
+            if srv.get("name", "").startswith("macaw-"):
+                await c.open_ports(srv["id"])
+                done.append(Cloud.ipv4(srv) or srv["name"])
+    except Exception as e:
+        log.exception("openports failed")
+        await message.answer(f"Could not open the ports: {html.escape(str(e))[:500]}", reply_markup=MENU)
+        return
+    if not done:
+        await message.answer("No servers made by this bot in your HostVDS account.", reply_markup=MENU)
+        return
+    await message.answer("Ports opened on " + ", ".join(f"<code>{html.escape(x)}</code>" for x in done)
+                         + ". Try connecting again in a minute.", reply_markup=MENU)
 
 
 @router.message(CommandStart())

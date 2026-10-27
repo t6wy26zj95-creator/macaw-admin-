@@ -340,8 +340,38 @@ class Cloud:
                 "volume_size": volume_gb, "delete_on_termination": True}]
         else:
             server["imageRef"] = image_id
+        server["security_groups"] = [{"name": await self.ensure_open_group()}]
         data = await self.call("POST", "compute", "/servers", {"server": server})
         return data["server"]["id"]
+
+    # The project's "default" security group lets nothing in, so SSH and the VPN ports were blocked.
+    # Our own group lets everything in (the VPN uses ports Amnezia picks); the server's own firewall
+    # is left as Ubuntu ships it.
+    OPEN_GROUP = "macaw-open"
+
+    async def ensure_open_group(self) -> str:
+        groups = (await self.call("GET", "network", f"/security-groups?name={self.OPEN_GROUP}")).get(
+            "security_groups", [])
+        if groups:
+            group = groups[0]
+        else:
+            group = (await self.call("POST", "network", "/security-groups", {"security_group": {
+                "name": self.OPEN_GROUP, "description": "Macaw: allow all incoming"}}))["security_group"]
+        have = {(r.get("direction"), r.get("ethertype"), r.get("protocol"), r.get("remote_ip_prefix"))
+                for r in group.get("security_group_rules", [])}
+        for eth, prefix in (("IPv4", "0.0.0.0/0"), ("IPv6", "::/0")):
+            if ("ingress", eth, None, prefix) in have or ("ingress", eth, None, None) in have:
+                continue
+            await self.call("POST", "network", "/security-group-rules", {"security_group_rule": {
+                "security_group_id": group["id"], "direction": "ingress", "ethertype": eth,
+                "remote_ip_prefix": prefix}}, ok=(200, 201, 409))
+        return self.OPEN_GROUP
+
+    async def open_ports(self, server_id: str) -> None:
+        """Put an existing server into the allow-all group."""
+        name = await self.ensure_open_group()
+        await self.call("POST", "compute", f"/servers/{server_id}/action",
+                        {"addSecurityGroup": {"name": name}}, ok=(200, 202, 204, 409))
 
     async def get_server(self, server_id: str) -> dict:
         return (await self.call("GET", "compute", f"/servers/{server_id}"))["server"]
