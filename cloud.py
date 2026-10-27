@@ -322,12 +322,17 @@ class Cloud:
         return data.get("images", [])
 
     @staticmethod
-    def pick_ubuntu_2404(images: list[dict]) -> dict | None:
+    def ubuntu_2404_candidates(images: list[dict]) -> list[dict]:
+        """Ubuntu 24.04 images, best first. HostVDS also has "prebuilt_<app>_Ubuntu-24.04" images with
+        software already installed (e.g. awg-easy); we want the plain system, so those go last."""
         cands = [i for i in images if re.search(r"ubuntu", i.get("name", ""), re.I)
                  and re.search(r"24\.04|noble", i.get("name", ""), re.I)]
-        # HostVDS also has "prebuilt_<app>_Ubuntu-24.04" images with software already installed
-        # (e.g. awg-easy). We want the plain system, so those only count if nothing else exists.
         cands.sort(key=lambda i: (not Cloud.is_prebuilt(i), i.get("created_at", "")), reverse=True)
+        return cands
+
+    @staticmethod
+    def pick_ubuntu_2404(images: list[dict]) -> dict | None:
+        cands = Cloud.ubuntu_2404_candidates(images)
         return cands[0] if cands else None
 
     @staticmethod
@@ -346,7 +351,6 @@ class Cloud:
                 "volume_size": volume_gb, "delete_on_termination": True}]
         else:
             server["imageRef"] = image_id
-        server["security_groups"] = [{"name": await self.ensure_open_group()}]
         data = await self.call("POST", "compute", "/servers", {"server": server})
         return data["server"]["id"]
 

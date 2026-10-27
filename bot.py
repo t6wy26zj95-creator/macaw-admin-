@@ -540,22 +540,46 @@ async def create_server(bot: Bot) -> None:
     ip = None
     try:
         await progress.step("1/3 Ordering the server")
-        if Cloud.is_prebuilt({"name": CFG.get("HOSTVDS_IMAGE_LABEL", "")}):
-            # Setup used to pick a prebuilt image (Ubuntu with awg-easy) by mistake: switch to plain Ubuntu.
-            image = Cloud.pick_ubuntu_2404(await c.images())
-            if image and not Cloud.is_prebuilt(image):
-                set_env("HOSTVDS_IMAGE", image["id"])
-                set_env("HOSTVDS_IMAGE_LABEL", image.get("name", image["id"]))
         flavors = {f["id"]: f for f in await c.flavors()}
         flavor = flavors.get(CFG["HOSTVDS_FLAVOR"])
         if not flavor:
             raise CloudError("The saved plan no longer exists. Change the server settings.")
         pubkey = await ensure_ssh_key()
         name = f"macaw-{datetime.now():%Y%m%d-%H%M}"
-        sid = await c.create_server(name, flavor, CFG["HOSTVDS_IMAGE"], CFG["HOSTVDS_NETWORK"],
-                                    cloud_config(CFG["ROOT_PASSWORD"], pubkey))
-        await progress.step("2/3 Waiting for it to start")
-        srv = await c.wait_active(sid)
+        # Some images can't run on some plans ("No valid host was found"): then try the next
+        # Ubuntu 24.04 image (plain ones first) and remember the one that worked.
+        images = Cloud.ubuntu_2404_candidates(await c.images())
+        saved = [i for i in images if i["id"] == CFG["HOSTVDS_IMAGE"]]
+        if not images:
+            images = [{"id": CFG["HOSTVDS_IMAGE"], "name": CFG.get("HOSTVDS_IMAGE_LABEL", "")}]
+        elif saved and not Cloud.is_prebuilt(saved[0]):
+            images = saved + [i for i in images if i is not saved[0]]
+        srv = None
+        for n, image in enumerate(images):
+            if n:
+                progress.finish_running("failed")
+                await progress.step(f"1/3 That system did not start on this plan, trying {image.get('name', image['id'])}")
+            sid = await c.create_server(name, flavor, image["id"], CFG["HOSTVDS_NETWORK"],
+                                        cloud_config(CFG["ROOT_PASSWORD"], pubkey))
+            await progress.step("2/3 Waiting for it to start")
+            try:
+                srv = await c.wait_active(sid)
+                break
+            except CloudError as e:
+                if "no valid host" not in str(e).lower():
+                    raise
+                log.warning("image %s failed: %s", image.get("name"), e)
+                try:  # a server in ERROR state is useless: don't leave it in the account
+                    await c.delete_server(sid)
+                except Exception:
+                    log.exception("could not delete failed server")
+                if n == len(images) - 1:
+                    raise
+        if image["id"] != CFG["HOSTVDS_IMAGE"]:
+            set_env("HOSTVDS_IMAGE", image["id"])
+            set_env("HOSTVDS_IMAGE_LABEL", image.get("name", image["id"]))
+        # The project's default firewall lets nothing in: allow SSH and the VPN.
+        await c.open_ports(sid)
         ip = Cloud.ipv4(srv)
         await progress.step(f"3/3 Waiting for SSH on {ip}")
         if not await wait_port_22(ip):
