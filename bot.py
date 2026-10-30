@@ -9,6 +9,7 @@ import html
 import ipaddress
 import logging
 import os
+import json
 import re
 import signal
 import smtplib
@@ -131,6 +132,7 @@ class State:
     email_password: str = ""
     cloud_tmp: dict = field(default_factory=dict)    # HostVDS settings being set up
     cloud_lists: dict = field(default_factory=dict)  # flavors / networks / images to pick from
+    cloud_diag: dict = field(default_factory=dict)   # what the last server creation ran into
     del_ip: str = ""
     pending_file: tuple[str, str] | None = None  # (file_id, file_name) waiting for Send
     task: asyncio.Task | None = None
@@ -546,42 +548,53 @@ async def create_server(bot: Bot) -> None:
             raise CloudError("The saved plan no longer exists. Change the server settings.")
         pubkey = await ensure_ssh_key()
         name = f"macaw-{datetime.now():%Y%m%d-%H%M}"
-        # Some images can't run on some plans ("No valid host was found"): then try the next
-        # Ubuntu 24.04 image (plain ones first) and remember the one that worked.
+        lim = await c.limits()
+        S.cloud_diag = {"limits": lim, "tries": []}
+        problem = Cloud.limit_problem(lim, flavor)
+        if problem:
+            raise CloudError(f"Your HostVDS account is at its limit ({problem}). "
+                             "Delete a server you don't need (/delete IP) or ask HostVDS to raise the limit.")
         images = Cloud.ubuntu_2404_candidates(await c.images())
-        saved = [i for i in images if i["id"] == CFG["HOSTVDS_IMAGE"]]
-        if not images:
-            images = [{"id": CFG["HOSTVDS_IMAGE"], "name": CFG.get("HOSTVDS_IMAGE_LABEL", "")}]
-        elif saved and not Cloud.is_prebuilt(saved[0]):
-            images = saved + [i for i in images if i is not saved[0]]
-        # Every image failing means HostVDS has no room for this plan here, so stop after two.
-        images = images[:2]
+        saved = [i for i in images if i["id"] == CFG["HOSTVDS_IMAGE"]] or \
+            [{"id": CFG["HOSTVDS_IMAGE"], "name": CFG.get("HOSTVDS_IMAGE_LABEL", "")}]
+        others = [i for i in images if i["id"] != saved[0]["id"]]
+        # "No valid host was found" = HostVDS found no machine for this request. First try the
+        # default place, then each location (availability zone), then one other image.
+        zones = await c.zones()
+        S.cloud_diag["zones"] = zones
+        first = CFG.get("HOSTVDS_ZONE") or None
+        tries = [(saved[0], first)] + [(saved[0], z) for z in zones if z not in ("nova", first)][:4] + \
+                [(i, None) for i in others[:1]]
         srv = None
-        for n, image in enumerate(images):
+        for n, (image, zone) in enumerate(tries):
+            what = image.get("name", image["id"]) + (f" in {zone}" if zone else "")
             if n:
                 progress.finish_running("failed")
-                await progress.step(f"1/3 That system did not start on this plan, trying {image.get('name', image['id'])}")
+                await progress.step(f"1/3 No room there, trying {what}")
             sid = await c.create_server(name, flavor, image["id"], CFG["HOSTVDS_NETWORK"],
-                                        cloud_config(CFG["ROOT_PASSWORD"], pubkey))
+                                        cloud_config(CFG["ROOT_PASSWORD"], pubkey), zone=zone)
             await progress.step("2/3 Waiting for it to start")
             try:
                 srv = await c.wait_active(sid)
                 break
             except CloudError as e:
+                S.cloud_diag["tries"].append({"what": what, "fault": getattr(c, "last_fault", {}) or str(e)})
                 if "no valid host" not in str(e).lower():
                     raise
-                log.warning("image %s failed: %s", image.get("name"), e)
+                log.warning("%s failed: %s", what, e)
                 try:  # a server in ERROR state is useless: don't leave it in the account
                     await c.delete_server(sid)
                 except Exception:
                     log.exception("could not delete failed server")
-                if n == len(images) - 1:
-                    raise CloudError("HostVDS can't place this plan right now (\"No valid host was found\"). "
-                                     "That usually means the plan is out of stock in this location, or the "
-                                     "account hit a server limit. The failed servers were deleted.")
+                if n == len(tries) - 1:
+                    raise CloudError("HostVDS found no room for this server anywhere it was asked "
+                                     "(\"No valid host was found\"). The failed servers were deleted. "
+                                     "Send /hostvds and show me the answer.")
         if image["id"] != CFG["HOSTVDS_IMAGE"]:
             set_env("HOSTVDS_IMAGE", image["id"])
             set_env("HOSTVDS_IMAGE_LABEL", image.get("name", image["id"]))
+        if zone:
+            set_env("HOSTVDS_ZONE", zone)
         # The project's default firewall lets nothing in: allow SSH and the VPN.
         await c.open_ports(sid)
         ip = Cloud.ipv4(srv)
@@ -822,6 +835,56 @@ async def drop_buttons(cb: CallbackQuery) -> None:
         await cb.message.edit_reply_markup(reply_markup=None)
     except TelegramAPIError:
         pass
+
+
+@router.message(Command("hostvds"))
+async def cmd_hostvds(message: Message):
+    """What HostVDS says about the account: limits, locations, servers, last failure. For debugging."""
+    if not cloud_creds_ready():
+        await message.answer("HostVDS isn't set up yet.", reply_markup=MENU)
+        return
+    c = Cloud(CFG)
+    out = []
+    try:
+        await c.auth()
+        regions = sorted({e.get("region") or e.get("region_id") or "?" for svc in c.catalog
+                          if svc.get("type") == "compute" for e in svc.get("endpoints", [])})
+        out.append(f"Regions: {', '.join(regions)} (using {CFG.get('OS_REGION_NAME') or 'first'})")
+        out.append(f"Zones: {', '.join(await c.zones()) or 'none listed'}")
+        lim = await c.limits()
+        out.append("Limits: " + ", ".join(f"{k}={v}" for k, v in sorted(lim.items())
+                                          if k.startswith(("max", "total")) and "Personality" not in k
+                                          and "Meta" not in k and "Keypair" not in k and "Group" not in k))
+        flavors = {f["id"]: f for f in await c.flavors()}
+        f = flavors.get(CFG.get("HOSTVDS_FLAVOR", ""))
+        if f:
+            extra = {}
+            try:
+                extra = (await c.call("GET", "compute", f"/flavors/{f['id']}/os-extra_specs")).get("extra_specs", {})
+            except CloudError:
+                pass
+            out.append(f"Plan: {flavor_label(f)}; extra: {json.dumps(extra)[:300]}")
+        try:
+            net = (await c.call("GET", "network", f"/networks/{CFG.get('HOSTVDS_NETWORK', '')}")).get("network", {})
+            out.append(f"Network: {net.get('name')} zones={net.get('availability_zones')} "
+                       f"hints={net.get('availability_zone_hints')}")
+        except CloudError as e:
+            out.append(f"Network: {e}")
+        out.append(f"System: {CFG.get('HOSTVDS_IMAGE_LABEL')} ({CFG.get('HOSTVDS_IMAGE')})")
+        servers = (await c.call("GET", "compute", "/servers/detail")).get("servers", [])
+        out.append(f"Servers ({len(servers)}):")
+        for srv in servers:
+            out.append(f"  {srv.get('name')} {Cloud.ipv4(srv) or '-'} {srv.get('status')} "
+                       f"zone={srv.get('OS-EXT-AZ:availability_zone', '?')} "
+                       f"flavor={(srv.get('flavor') or {}).get('original_name') or (srv.get('flavor') or {}).get('id')}")
+    except Exception as e:
+        out.append(f"Error: {e}")
+    if S.cloud_diag.get("tries"):
+        out.append("Last attempt:")
+        for t in S.cloud_diag["tries"]:
+            out.append(f"  {t['what']}: {json.dumps(t['fault'])[:400]}")
+    text = "\n".join(out)
+    await message.answer(f"<pre>{html.escape(text)[:3900]}</pre>", reply_markup=MENU)
 
 
 @router.message(Command("delete"))

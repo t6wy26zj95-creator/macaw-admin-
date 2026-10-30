@@ -342,9 +342,11 @@ class Cloud:
     # ---- servers ----
 
     async def create_server(self, name: str, flavor: dict, image_id: str, network_id: str,
-                            user_data: str, volume_gb: int = 20) -> str:
+                            user_data: str, volume_gb: int = 20, zone: str | None = None) -> str:
         server = {"name": name, "flavorRef": flavor["id"], "networks": [{"uuid": network_id}],
                   "user_data": base64.b64encode(user_data.encode()).decode()}
+        if zone:
+            server["availability_zone"] = zone
         if flavor.get("disk", 0) == 0:  # flavor without local disk: boot from a volume
             server["block_device_mapping_v2"] = [{
                 "boot_index": 0, "uuid": image_id, "source_type": "image", "destination_type": "volume",
@@ -398,12 +400,42 @@ class Cloud:
         for _ in range(timeout // 10):
             srv = await self.get_server(server_id)
             if srv.get("status") == "ERROR":
-                fault = (srv.get("fault") or {}).get("message", "")
-                raise CloudError(f"HostVDS reports the new server failed: {fault}")
+                fault = srv.get("fault") or {}
+                self.last_fault = fault
+                raise CloudError(f"HostVDS reports the new server failed: {fault.get('message', '')}")
             if srv.get("status") == "ACTIVE" and self.ipv4(srv):
                 return srv
             await asyncio.sleep(10)
         raise CloudError("The new server did not become ready in 10 minutes")
+
+    async def zones(self) -> list[str]:
+        """Availability zones that are up (HostVDS locations may be zones)."""
+        try:
+            data = await self.call("GET", "compute", "/os-availability-zone")
+        except CloudError:
+            return []
+        return [z["zoneName"] for z in data.get("availabilityZoneInfo", [])
+                if (z.get("zoneState") or {}).get("available", True) and z.get("zoneName")]
+
+    async def limits(self) -> dict:
+        try:
+            return (await self.call("GET", "compute", "/limits")).get("limits", {}).get("absolute", {})
+        except CloudError:
+            return {}
+
+    @staticmethod
+    def limit_problem(lim: dict, flavor: dict) -> str | None:
+        """Why the account can't take one more server of this flavor, if the limits say so."""
+        def over(max_key, used_key, need):
+            mx, used = lim.get(max_key), lim.get(used_key)
+            return isinstance(mx, int) and mx >= 0 and isinstance(used, int) and used + need > mx
+        if over("maxTotalInstances", "totalInstancesUsed", 1):
+            return f"servers: {lim['totalInstancesUsed']} of {lim['maxTotalInstances']} used"
+        if over("maxTotalCores", "totalCoresUsed", flavor.get("vcpus", 1)):
+            return f"CPUs: {lim['totalCoresUsed']} of {lim['maxTotalCores']} used"
+        if over("maxTotalRAMSize", "totalRAMUsed", flavor.get("ram", 0)):
+            return f"RAM: {lim['totalRAMUsed']} of {lim['maxTotalRAMSize']} MB used"
+        return None
 
     async def find_by_ip(self, ip: str) -> dict | None:
         data = await self.call("GET", "compute", "/servers/detail")
